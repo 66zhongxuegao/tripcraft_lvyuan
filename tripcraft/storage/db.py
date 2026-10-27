@@ -9,6 +9,7 @@ import json
 import os
 import sqlite3
 import threading
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -16,6 +17,26 @@ ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DB = ROOT / "tripcraft.sqlite"
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+  user_id TEXT PRIMARY KEY, username TEXT UNIQUE, display_name TEXT DEFAULT '',
+  password_hash TEXT DEFAULT '', password_salt TEXT DEFAULT '', login_password TEXT DEFAULT '', kind TEXT DEFAULT 'real',
+  company TEXT DEFAULT '', phone TEXT DEFAULT '', email TEXT DEFAULT '', bio TEXT DEFAULT '',
+  created_at TEXT, updated_at TEXT, last_login_at TEXT);
+CREATE TABLE IF NOT EXISTS sessions (
+  token_hash TEXT PRIMARY KEY, user_id TEXT, created_at TEXT, expires_at TEXT,
+  revoked_at TEXT DEFAULT '', last_seen_at TEXT DEFAULT '', ua TEXT DEFAULT '');
+CREATE TABLE IF NOT EXISTS profile_baseline (
+  user_id TEXT, dimension TEXT, value REAL DEFAULT 0, source TEXT DEFAULT '', created_at TEXT,
+  PRIMARY KEY (user_id, dimension));
+CREATE TABLE IF NOT EXISTS profile_snapshot (
+  snapshot_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, kind TEXT NOT NULL,
+  created_at TEXT NOT NULL, radar_json TEXT NOT NULL, report_json TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_profile_snapshot_user_time
+  ON profile_snapshot(user_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS quiz_question (
+  question_id TEXT PRIMARY KEY, user_id TEXT, skill_point_id TEXT,
+  payload TEXT, answer TEXT DEFAULT '', reference TEXT DEFAULT '',
+  created_at TEXT, answered_at TEXT DEFAULT '', correct INTEGER DEFAULT -1);
 CREATE TABLE IF NOT EXISTS profile (
   user_id TEXT PRIMARY KEY, level TEXT DEFAULT 'L1',
   deals INTEGER DEFAULT 0, lost INTEGER DEFAULT 0, complaints INTEGER DEFAULT 0, updated_at TEXT);
@@ -103,6 +124,9 @@ CREATE TABLE IF NOT EXISTS deliverable_doc (
   order_id TEXT, deliverable_id TEXT, version INTEGER DEFAULT 1,
   values_json TEXT, rendered TEXT, audience TEXT, guard_json TEXT,
   file_ids TEXT, at TEXT, PRIMARY KEY (order_id, deliverable_id));
+CREATE TABLE IF NOT EXISTS deliverable_draft (
+  order_id TEXT NOT NULL, deliverable_id TEXT NOT NULL, values_json TEXT NOT NULL,
+  updated_at TEXT NOT NULL, validation_json TEXT DEFAULT '', PRIMARY KEY (order_id, deliverable_id));
 CREATE TABLE IF NOT EXISTS deliverable_file (
   file_id TEXT PRIMARY KEY, order_id TEXT, deliverable_id TEXT,
   filename TEXT, mime TEXT, size INTEGER, data BLOB, at TEXT);
@@ -117,6 +141,30 @@ CREATE TABLE IF NOT EXISTS incident (
   incident_id TEXT PRIMARY KEY, order_id TEXT, code TEXT, step TEXT, title TEXT,
   channel TEXT, session_id TEXT, speaker TEXT, body TEXT, skill_points TEXT,
   rule TEXT, at TEXT);
+CREATE TABLE IF NOT EXISTS order_customer (
+  order_id TEXT PRIMARY KEY, card_json TEXT NOT NULL, version INTEGER NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS customer_fact_event (
+  event_id INTEGER PRIMARY KEY AUTOINCREMENT, order_id TEXT NOT NULL, fact_key TEXT NOT NULL,
+  value TEXT, state TEXT, kind TEXT NOT NULL, expected TEXT, source_channel TEXT, source_ref TEXT, at TEXT,
+  UNIQUE(order_id, fact_key, kind, source_channel, source_ref, value));
+CREATE INDEX IF NOT EXISTS idx_customer_fact_order ON customer_fact_event(order_id, event_id);
+CREATE TABLE IF NOT EXISTS customer_feedback_turn (
+  turn_id INTEGER PRIMARY KEY AUTOINCREMENT, order_id TEXT, channel TEXT, session_id TEXT,
+  speaker TEXT, text TEXT, source_ref TEXT UNIQUE, at TEXT);
+CREATE VIEW IF NOT EXISTS conversation_turn AS
+  SELECT s.order_id, s.mode AS channel, s.session_id,
+         CASE WHEN l.who='agent' THEN 'customer' ELSE 'consultant' END AS speaker,
+         l.text, 'call:' || printf('%020d', l.msg_id) AS source_ref, replace(l.created_at, ' ', 'T') AS at
+    FROM call_line l JOIN call_session s ON s.session_id=l.session_id
+  UNION ALL
+  SELECT s.order_id, 'im', s.session_id,
+         CASE WHEN m.role='me' THEN 'consultant' ELSE 'customer' END,
+         m.content, 'im:' || printf('%020d', m.msg_id), replace(m.created_at, ' ', 'T')
+    FROM im_message m JOIN im_session s ON s.session_id=m.session_id
+    WHERE s.kind='客户' AND m.kind='text' AND m.role IN ('me','other')
+  UNION ALL
+  SELECT order_id, channel, session_id, speaker, text, source_ref, replace(at, ' ', 'T')
+    FROM customer_feedback_turn;
 """
 
 
@@ -133,11 +181,21 @@ class Store:
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA)
         self._migrate()
+        self._migrate_ability_sources()
         self._migrate_supplier_state()
         self._conn.commit()
+        # 旧订单只保留既有明确值；不把缺失信息补成未经客户说过的事实。
+        for row in self._all("SELECT * FROM biz_order"):
+            self.ensure_customer_card(row["order_id"], row=row, fill_hidden=False)
 
     # 轻量迁移：老库缺列时补齐（不引入迁移框架）
     _MIGRATIONS: dict[str, dict[str, str]] = {
+        "users": {"login_password": "TEXT DEFAULT ''"},
+        "deliverable_draft": {"validation_json": "TEXT DEFAULT ''"},
+        "ability": {
+            "teach_source": "TEXT DEFAULT ''", "real_source": "TEXT DEFAULT ''",
+            "teach_updated_at": "TEXT DEFAULT ''", "real_updated_at": "TEXT DEFAULT ''",
+        },
         "im_session": {"order_id": "TEXT DEFAULT ''", "code": "TEXT DEFAULT ''"},
         "im_message": {"kind": "TEXT DEFAULT 'text'", "payload": "TEXT DEFAULT ''"},
         # 教学线程：题目卡与判分结果要跟着聊天记录一起存（kind=quiz / quiz_result）
@@ -176,6 +234,19 @@ class Store:
             self._conn.execute("DROP TABLE supplier_state_legacy")
             self._conn.commit()
 
+    def _migrate_ability_sources(self) -> None:
+        """旧能力值按已有证据标注来源；初始测评不会被标成学习训练。"""
+        self._conn.execute("""UPDATE ability SET teach_source='learning',
+            teach_updated_at=COALESCE((SELECT MAX(q.created_at) FROM quiz_attempt q
+                WHERE q.user_id=ability.user_id AND q.skill_point_id=ability.skill_point_id), updated_at)
+            WHERE teach_source='' AND EXISTS (SELECT 1 FROM quiz_attempt q
+                WHERE q.user_id=ability.user_id AND q.skill_point_id=ability.skill_point_id)""")
+        self._conn.execute("""UPDATE ability SET teach_source='initial', teach_updated_at=updated_at
+            WHERE teach_source='' AND EXISTS (SELECT 1 FROM profile_baseline b
+                WHERE b.user_id=ability.user_id AND b.dimension=substr(ability.skill_point_id,1,2))""")
+        self._conn.execute("""UPDATE ability SET real_source='practice', real_updated_at=updated_at
+            WHERE real_source='' AND real_v>0""")
+
     def _exec(self, sql: str, args: tuple = ()) -> sqlite3.Cursor:
         with self._lock:
             cur = self._conn.execute(sql, args)
@@ -201,26 +272,34 @@ class Store:
     def get_profile(self, user_id: str) -> dict | None:
         return self._one("SELECT * FROM profile WHERE user_id=?", (user_id,))
 
-    def set_ability(self, user_id: str, sp: str, teach: float | None = None, real_v: float | None = None) -> None:
+    def set_ability(self, user_id: str, sp: str, teach: float | None = None,
+                    real_v: float | None = None, *, source: str = "") -> None:
         self.ensure_profile(user_id)
         row = self._one("SELECT * FROM ability WHERE user_id=? AND skill_point_id=?", (user_id, sp))
         t = row["teach"] if (row and teach is None) else (teach if teach is not None else 0)
         r = row["real_v"] if (row and real_v is None) else (real_v if real_v is not None else 0)
+        ts = now()
+        teach_source = (source or "learning") if teach is not None else (row or {}).get("teach_source", "")
+        real_source = (source or "practice") if real_v is not None else (row or {}).get("real_source", "")
+        teach_at = ts if teach is not None else (row or {}).get("teach_updated_at", "")
+        real_at = ts if real_v is not None else (row or {}).get("real_updated_at", "")
         if row:
-            self._exec("UPDATE ability SET teach=?, real_v=?, updated_at=? WHERE user_id=? AND skill_point_id=?",
-                       (t, r, now(), user_id, sp))
+            self._exec("UPDATE ability SET teach=?, real_v=?, updated_at=?, teach_source=?, real_source=?, "
+                       "teach_updated_at=?, real_updated_at=? WHERE user_id=? AND skill_point_id=?",
+                       (t, r, ts, teach_source, real_source, teach_at, real_at, user_id, sp))
         else:
-            self._exec("INSERT INTO ability(user_id, skill_point_id, teach, real_v, updated_at) VALUES(?,?,?,?,?)",
-                       (user_id, sp, t, r, now()))
+            self._exec("INSERT INTO ability(user_id, skill_point_id, teach, real_v, updated_at, "
+                       "teach_source, real_source, teach_updated_at, real_updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                       (user_id, sp, t, r, ts, teach_source, real_source, teach_at, real_at))
 
     def abilities(self, user_id: str) -> dict[str, dict]:
         return {r["skill_point_id"]: r for r in self._all("SELECT * FROM ability WHERE user_id=?", (user_id,))}
 
     def has_profile_data(self, user_id: str) -> bool:
-        """是否已有画像数据 —— 决定「初始画像」还能不能做。
+        """是否已有能力或训练记录；初始测评是否完成由 has_initial_assessment 单独判断。
 
         有非零掌握度 / 做过题 / 有实战评分，任一条成立即视为已建档。
-        新用户（刚建号、没有能力行）才可以做初始画像。
+        做题和实战记录不代表做过初始测评。
         """
         row = self._one("SELECT COUNT(*) AS n FROM ability WHERE user_id=? AND (teach > 0 OR real_v > 0)",
                         (user_id,))
@@ -233,13 +312,203 @@ class Store:
             JOIN biz_order o ON o.order_id = os.order_id WHERE o.user_id=?""", (user_id,))
         return bool(row and int(row["n"] or 0) > 0)
 
+    def has_initial_assessment(self, user_id: str) -> bool:
+        """初始测评以持久化基线或初始报告为准，不被做题、实战评分挡住。"""
+        if self._one("SELECT 1 FROM profile_baseline WHERE user_id=? LIMIT 1", (user_id,)):
+            return True
+        # 兼容只有初始报告、尚未写基线表的旧账号；动态刷新报告不算初始测评。
+        for row in self._all("SELECT source_thread, content FROM memory "
+                             "WHERE user_id=? AND type='profile_report'", (user_id,)):
+            if row.get("source_thread") == "profile:assessment":
+                return True
+            try:
+                report = json.loads(row.get("content") or "{}")
+            except (TypeError, ValueError):
+                continue
+            if isinstance(report, dict) and report.get("kind") == "initial":
+                return True
+        return False
+
+    # ---------------- 身份与会话（owner: identity 域） ----------------
+    # users/sessions 是认证的唯一持久层：只存口令的加盐哈希与 token 的 sha256 摘要。
+    # 其他域只允许读 user_by_id / user_by_name，写操作一律走 identity 的 AuthService。
+
+    def create_user(self, user_id: str, username: str, password_hash: str, password_salt: str,
+                    display_name: str = "", kind: str = "real") -> dict:
+        ts = now()
+        self._exec("INSERT INTO users(user_id, username, display_name, password_hash, password_salt,"
+                   " kind, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                   (user_id, username, display_name or username, password_hash, password_salt, kind, ts, ts))
+        return self.user_by_id(user_id) or {}  # type: ignore[return-value]
+
+    def user_by_id(self, user_id: str) -> dict | None:
+        return self._one("SELECT * FROM users WHERE user_id=?", (user_id,))
+
+    def user_by_name(self, username: str) -> dict | None:
+        return self._one("SELECT * FROM users WHERE username=?", (username,))
+
+    def set_login_password(self, user_id: str, password: str) -> None:
+        """本地登录助手使用；与不可逆 password_hash 分开保存。"""
+        self._exec("UPDATE users SET login_password=? WHERE user_id=?", (password or "", user_id))
+
+    def set_user_password(self, user_id: str, password_hash: str, password_salt: str) -> None:
+        self._exec("UPDATE users SET password_hash=?, password_salt=?, updated_at=? WHERE user_id=?",
+                   (password_hash, password_salt, now(), user_id))
+
+    def update_user_profile(self, user_id: str, fields: dict) -> dict | None:
+        """只允许改公开个人资料字段；口令列永远不经此入口。"""
+        allowed = ("display_name", "company", "phone", "email", "bio")
+        sets: list[str] = []
+        args: list = []
+        for key in allowed:
+            if key in fields and fields[key] is not None:
+                sets.append(f"{key}=?")
+                args.append(str(fields[key]))
+        if sets:
+            sets.append("updated_at=?")
+            args.append(now())
+            args.append(user_id)
+            self._exec(f"UPDATE users SET {', '.join(sets)} WHERE user_id=?", tuple(args))
+        return self.user_by_id(user_id)
+
+    def touch_login(self, user_id: str) -> None:
+        ts = now()
+        self._exec("UPDATE users SET last_login_at=?, updated_at=? WHERE user_id=?",
+                   (ts, ts, user_id))
+
+    def create_session(self, token_hash: str, user_id: str, expires_at: str, ua: str = "") -> None:
+        ts = now()
+        self._exec("INSERT OR REPLACE INTO sessions(token_hash, user_id, created_at, expires_at,"
+                   " revoked_at, last_seen_at, ua) VALUES(?,?,?,?,?,?,?)",
+                   (token_hash, user_id, ts, expires_at, "", ts, ua))
+
+    def session_by_hash(self, token_hash: str) -> dict | None:
+        return self._one("SELECT * FROM sessions WHERE token_hash=?", (token_hash,))
+
+    def touch_session(self, token_hash: str) -> None:
+        self._exec("UPDATE sessions SET last_seen_at=? WHERE token_hash=?", (now(), token_hash))
+
+    def revoke_session(self, token_hash: str) -> None:
+        self._exec("UPDATE sessions SET revoked_at=? WHERE token_hash=?", (now(), token_hash))
+
+    def purge_expired_sessions(self, before: str = "") -> int:
+        """清理已过期或已登出的会话，返回删除行数。"""
+        cur = self._exec("DELETE FROM sessions WHERE expires_at < ? OR revoked_at != ''",
+                         (before or now(),))
+        return int(cur.rowcount or 0)
+
+    # 画像初始基线（R12）：初始测评的快照，唯一不被后续评分覆盖的口径来源。
+    def save_baseline(self, user_id: str, dimension: str, value: float,
+                      source: str = "intake") -> None:
+        self._exec("INSERT OR REPLACE INTO profile_baseline(user_id, dimension, value, source, created_at)"
+                   " VALUES(?,?,?,?,?)", (user_id, dimension, float(value), source, now()))
+
+    def baseline(self, user_id: str) -> dict[str, dict]:
+        return {r["dimension"]: r for r in
+                self._all("SELECT * FROM profile_baseline WHERE user_id=?", (user_id,))}
+
+    def initial_profile_report(self, user_id: str) -> dict:
+        """兼容尚无快照表的旧初始报告，只取本人实际保存的初始测评。"""
+        rows = self._all("SELECT content, created_at FROM memory WHERE user_id=? "
+                         "AND type='profile_report' ORDER BY created_at, rowid", (user_id,))
+        for row in rows:
+            try:
+                report = json.loads(row.get("content") or "{}")
+            except (TypeError, ValueError):
+                continue
+            if isinstance(report, dict) and report.get("kind") == "initial":
+                report["created_at"] = report.get("created_at") or row.get("created_at") or ""
+                return report
+        return {}
+
+    def save_profile_snapshot(self, user_id: str, kind: str, radar: dict, report: dict) -> dict:
+        """报告与雷达历史原子保存；历史 JSON 不随后续能力变动而重算。"""
+        snapshot_id = "ps_" + uuid.uuid4().hex
+        ts = now()
+        meta = {"id": snapshot_id, "kind": kind, "at": ts}
+        radar = {**radar, "snapshot_id": snapshot_id, "at": ts}
+        report = {**report, "created_at": ts}
+        radar_json = json.dumps(radar, ensure_ascii=False)
+        report_json = json.dumps(report, ensure_ascii=False)
+        with self._lock, self._conn:
+            self._conn.execute("INSERT INTO profile_snapshot "
+                               "(snapshot_id,user_id,kind,created_at,radar_json,report_json) VALUES(?,?,?,?,?,?)",
+                               (snapshot_id, user_id, kind, ts, radar_json, report_json))
+            self._conn.execute("INSERT INTO memory "
+                               "(memory_id,user_id,type,content,importance,source_thread,created_at) VALUES(?,?,?,?,?,?,?)",
+                               ("mem_" + uuid.uuid4().hex, user_id, "profile_report", report_json,
+                                0.8 if kind == "initial" else 0.7,
+                                "profile:assessment" if kind == "initial" else "profile:refresh", ts))
+        return {"snapshot": meta, "radar": radar, "report": report}
+
+    def profile_snapshots(self, user_id: str) -> list[dict]:
+        return self._all("SELECT snapshot_id AS id, kind, created_at AS at FROM profile_snapshot "
+                         "WHERE user_id=? ORDER BY created_at DESC, rowid DESC", (user_id,))
+
+    def profile_snapshot(self, user_id: str, snapshot_id: str) -> dict | None:
+        row = self._one("SELECT snapshot_id AS id, kind, created_at AS at, radar_json, report_json "
+                        "FROM profile_snapshot WHERE user_id=? AND snapshot_id=?", (user_id, snapshot_id))
+        if not row:
+            return None
+        return {"id": row["id"], "kind": row["kind"], "at": row["at"],
+                "radar": json.loads(row["radar_json"]), "report": json.loads(row["report_json"])}
+
+    # ---------------- 题目与答案只存服务端（P0：判分不得信客户端） ----------------
+    # `pick_question` 出题后把**完整题卡（含答案/参考/讲解）**按 question_id 落这张表，
+    # 下发给前端的题卡一律经过剥离；`submit_answer` 只按 question_id 取回服务端题库再判分，
+    # 客户端传来的 stem/answer/reference/explain 不参与判分。
+
+    def save_quiz_question(self, question_id: str, user_id: str, sp: str, payload: dict,
+                           answer: str = "", reference: str = "") -> None:
+        self._exec("INSERT OR REPLACE INTO quiz_question(question_id, user_id, skill_point_id,"
+                   " payload, answer, reference, created_at, answered_at, correct)"
+                   " VALUES(?,?,?,?,?,?,?,'',-1)",
+                   (question_id, user_id, sp, json.dumps(payload, ensure_ascii=False),
+                    str(answer or ""), str(reference or ""), now()))
+
+    def quiz_question(self, question_id: str) -> dict | None:
+        """按 question_id 精确取回服务端题目存档（含 user/sp 归属，用于越权判定）。"""
+        return self._one("SELECT * FROM quiz_question WHERE question_id=?", (question_id,))
+
+    def mark_quiz_answered(self, question_id: str, correct: bool) -> None:
+        self._exec("UPDATE quiz_question SET answered_at=?, correct=? WHERE question_id=?",
+                   (now(), 1 if correct else 0, question_id))
+
+    def claim_quiz_question(self, question_id: str) -> bool:
+        """**原子**地把题目标记为已作答，返回 True 表示本次抢占成功（之前未作答过）。
+
+        用单条带 WHERE 条件的 UPDATE 做并发闸门：同一 question_id 被重复/并发提交时只有一次能抢占成功，
+        其余一律拒绝，因此不会重复判分、重复加分。抢占失败时不得再写 attempts / ability / memory。
+        """
+        cur = self._exec(
+            "UPDATE quiz_question SET answered_at=? "
+            "WHERE question_id=? AND (answered_at IS NULL OR answered_at='')",
+            (now(), question_id))
+        return bool(cur.rowcount)
+
+    def release_quiz_claim(self, question_id: str) -> None:
+        """判分过程异常时回滚抢占，避免题目被卡成「已作答但没判分」。"""
+        self._exec("UPDATE quiz_question SET answered_at='' WHERE question_id=? AND correct=-1",
+                   (question_id,))
+
     def latest_memory(self, user_id: str, type_: str) -> dict | None:
         return self._one("""SELECT * FROM memory WHERE user_id=? AND type=?
             ORDER BY created_at DESC, rowid DESC LIMIT 1""", (user_id, type_))
 
     # 线程
     def get_or_create_thread(self, user_id: str, sp: str) -> dict:
-        tid = "thread:" + sp
+        """按 **用户 + 技能点** 取/建唯一线程。
+
+        线程 ID 必须带 user_id。历史实现用的是 `thread:<技能点ID>`（**全局一条**），
+        导致所有账号共用同一线程：新注册账号在 /learn/thread/C6.1 能看到别人的旧对话与已答题记录
+        （已发生的跨账号串数据缺陷）。本方法同时是线程历史、题卡、个性化资产的唯一入口，
+        因此改这一处即可让三者的读写都按用户隔离。
+
+        旧格式 `thread:<技能点ID>` 的行**保留不动**（不删除、不改归属）：
+        其中的历史消息无法按用户归属，把它归属给任何账号都是错误归属；
+        因此它不再作为读写目标，新账号一律得到属于自己的空线程。
+        """
+        tid = f"thread:{user_id}:{sp}"
         self._exec("INSERT OR IGNORE INTO thread(thread_id, user_id, skill_point_id, created_at, last_active_at) VALUES(?,?,?,?,?)",
                    (tid, user_id, sp, now(), now()))
         return self._one("SELECT * FROM thread WHERE thread_id=?", (tid,))  # type: ignore
@@ -303,14 +572,130 @@ class Store:
                      status: str, stage_index: int, payload: dict | None = None) -> None:
         self._exec("INSERT OR REPLACE INTO biz_order(order_id, user_id, customer, destination, status, stage_index, payload, created_at) VALUES(?,?,?,?,?,?,?,?)",
                    (order_id, user_id, customer, destination, status, stage_index, json.dumps(payload or {}, ensure_ascii=False), now()))
+        self.ensure_customer_card(order_id, fill_hidden=bool((payload or {}).get("generated")))
 
     def orders(self, user_id: str | None = None) -> list[dict]:
         if user_id:
-            return self._all("SELECT * FROM biz_order WHERE user_id=? ORDER BY created_at DESC", (user_id,))
-        return self._all("SELECT * FROM biz_order ORDER BY created_at DESC")
+            rows = self._all("SELECT * FROM biz_order WHERE user_id=? ORDER BY created_at DESC", (user_id,))
+        else:
+            rows = self._all("SELECT * FROM biz_order ORDER BY created_at DESC")
+        cards = {r["order_id"]: json.loads(r["card_json"]) for r in self._all("SELECT order_id,card_json FROM order_customer")}
+        for row in rows:
+            row["_customer_card"] = cards.get(row["order_id"])
+        return rows
 
     def order(self, order_id: str) -> dict | None:
-        return self._one("SELECT * FROM biz_order WHERE order_id=?", (order_id,))
+        row = self._one("SELECT * FROM biz_order WHERE order_id=?", (order_id,))
+        if row:
+            row["_customer_card"] = self.ensure_customer_card(order_id, row=row)
+        return row
+
+    def ensure_customer_card(self, order_id: str, *, row: dict | None = None,
+                             fill_hidden: bool | None = None) -> dict:
+        from ..services.customer_card import build_card, load_payload
+        saved = self._one("SELECT card_json FROM order_customer WHERE order_id=?", (order_id,))
+        if saved:
+            return json.loads(saved["card_json"])
+        row = row or self._one("SELECT * FROM biz_order WHERE order_id=?", (order_id,))
+        if not row:
+            raise ValueError(f"未找到订单: {order_id}")
+        if fill_hidden is None:
+            fill_hidden = bool(load_payload(row).get("generated"))
+        card = build_card(row, fill_hidden=fill_hidden)
+        self._exec("INSERT OR IGNORE INTO order_customer(order_id,card_json,version,updated_at) VALUES(?,?,?,?)",
+                   (order_id, json.dumps(card, ensure_ascii=False), card["version"], now()))
+        for issue in card.get("issues", []):
+            self.record_customer_conflict(order_id, issue, "migration", "initial-card")
+        return json.loads(self._one("SELECT card_json FROM order_customer WHERE order_id=?", (order_id,))["card_json"])
+
+    def observe_customer_facts(self, order_id: str, observations: dict, channel: str, source_ref: str,
+                               *, confirmed: bool = False) -> dict:
+        from ..services.customer_card import reconcile
+        self.ensure_customer_card(order_id)
+        with self._lock:
+            row = self._conn.execute("SELECT card_json FROM order_customer WHERE order_id=?", (order_id,)).fetchone()
+            card, events = reconcile(json.loads(row["card_json"]), observations, confirmed=confirmed)
+            if channel == "template_import":
+                for event in events:
+                    if event["kind"] == "confirmed":
+                        event["kind"] = "simulated"
+                        card["fields"][event["fact_key"]]["origin"] = "template_simulation"
+            try:
+                for event in events:
+                    self._conn.execute(
+                        "INSERT OR IGNORE INTO customer_fact_event(order_id,fact_key,value,state,kind,expected,source_channel,source_ref,at) VALUES(?,?,?,?,?,?,?,?,?)",
+                        (order_id, event["fact_key"], event["value"], event["state"], event["kind"],
+                         event.get("expected", ""), channel, source_ref, now()))
+                self._conn.execute("UPDATE order_customer SET card_json=?,version=?,updated_at=? WHERE order_id=?",
+                                   (json.dumps(card, ensure_ascii=False), card["version"], now(), order_id))
+                if any(event["kind"] in ("released", "confirmed", "simulated") for event in events):
+                    legacy = self._conn.execute("SELECT payload FROM biz_order WHERE order_id=?", (order_id,)).fetchone()
+                    payload = json.loads(legacy["payload"] or "{}")
+                    for event in events:
+                        if event["kind"] in ("released", "confirmed", "simulated") and not payload.get(event["fact_key"]):
+                            payload[event["fact_key"]] = event["value"]
+                    self._conn.execute("UPDATE biz_order SET payload=? WHERE order_id=?",
+                                       (json.dumps(payload, ensure_ascii=False), order_id))
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return card
+
+    def customer_fact_events(self, order_id: str) -> list[dict]:
+        return self._all("SELECT * FROM customer_fact_event WHERE order_id=? ORDER BY event_id", (order_id,))
+
+    def complete_template_identity(self, order_id: str, identity: dict) -> dict:
+        """只补齐缺失的客户身份/目的地，订单展示和角色共用同一份模拟补充。"""
+        self.ensure_customer_card(order_id)
+        unknown = {"", "待定", "未定", "未确定", "未知", "未明确", "待推荐", "未选择", "未提供"}
+        with self._lock, self._conn:
+            row = self._conn.execute("SELECT * FROM order_customer WHERE order_id=?", (order_id,)).fetchone()
+            card = json.loads(row["card_json"])
+            order = dict(self._conn.execute("SELECT * FROM biz_order WHERE order_id=?", (order_id,)).fetchone())
+            payload = json.loads(order.get("payload") or "{}")
+            changed = False
+            for key in ("customer", "destination", "source_market", "language", "age", "gender"):
+                value = str(identity.get(key) or "").strip()
+                if str(card["identity"].get(key) or "").strip() in unknown and value:
+                    card["identity"][key] = value
+                    changed = True
+                # 旧卡里已有稳定默认身份时同步到订单，表头、公开资料和通话保持同源。
+                if key not in ("customer", "destination") and str(payload.get(key) or "").strip() in unknown:
+                    payload[key] = card["identity"].get(key) or value
+                    changed = True
+            if changed:
+                card["version"] += 1
+                self._conn.execute("UPDATE order_customer SET card_json=?,version=?,updated_at=? WHERE order_id=?",
+                                   (json.dumps(card, ensure_ascii=False), card["version"], now(), order_id))
+                self._conn.execute("UPDATE biz_order SET customer=?,destination=?,payload=? WHERE order_id=?",
+                                   (card["identity"]["customer"], card["identity"]["destination"],
+                                    json.dumps(payload, ensure_ascii=False), order_id))
+        return card
+
+    def record_customer_conflict(self, order_id: str, issue: dict, channel: str, source_ref: str) -> None:
+        self._exec("INSERT OR IGNORE INTO customer_fact_event(order_id,fact_key,value,state,kind,expected,source_channel,source_ref,at) VALUES(?,?,?,?,?,?,?,?,?)",
+                   (order_id, issue.get("key", "reply"), str(issue.get("value") or issue.get("reason") or ""),
+                    issue.get("reason", ""), "conflict", str(issue.get("expected") or ""), channel, source_ref, now()))
+
+    def conversation_turns(self, order_id: str, limit: int = 10, exclude_session: str = "") -> list[dict]:
+        return list(reversed(self._all(
+            "SELECT * FROM conversation_turn WHERE order_id=? AND (?='' OR session_id<>?) ORDER BY at DESC, source_ref DESC LIMIT ?",
+            (order_id, exclude_session, exclude_session, max(1, min(limit, 100))))))
+
+    def recent_im_cards(self, order_id: str, limit: int = 5) -> list[dict]:
+        """客户在 IM 里收到的交付物卡片（按时间正序），供客户 Agent 读取正文摘要。"""
+        rows = self._all(
+            "SELECT m.msg_id, m.sender, m.content, m.payload, m.created_at "
+            "FROM im_message m JOIN im_session s ON s.session_id=m.session_id "
+            "WHERE s.order_id=? AND s.kind='客户' AND m.kind='card' "
+            "ORDER BY m.msg_id DESC LIMIT ?",
+            (order_id, max(1, min(limit, 20))))
+        return list(reversed(rows))
+
+    def add_customer_turn(self, order_id: str, channel: str, speaker: str, text: str, source_ref: str) -> None:
+        self._exec("INSERT OR IGNORE INTO customer_feedback_turn(order_id,channel,session_id,speaker,text,source_ref,at) VALUES(?,?,?,?,?,?,?)",
+                   (order_id, channel, "", speaker, text, source_ref, now()))
 
     def set_stage(self, order_id: str, stage_index: int) -> None:
         self._exec("UPDATE biz_order SET stage_index=? WHERE order_id=?", (stage_index, order_id))
@@ -358,12 +743,13 @@ class Store:
         return out
 
     def add_im_message(self, session_id: str, sender: str, role: str, content: str,
-                       kind: str = "text", payload: dict | None = None) -> None:
-        """写一条消息。kind: text / file / card / system（系统消息用于加人、改名、建群）。"""
-        self._exec("INSERT INTO im_message(session_id, sender, role, content, created_at, kind, payload)"
-                   " VALUES(?,?,?,?,?,?,?)",
-                   (session_id, sender, role, content, now(), kind,
-                    json.dumps(payload or {}, ensure_ascii=False)))
+                       kind: str = "text", payload: dict | None = None) -> int:
+        """写一条消息并返回 msg_id（证据链用 `im:session:msg_id` 引用）。"""
+        cur = self._exec("INSERT INTO im_message(session_id, sender, role, content, created_at, kind, payload)"
+                         " VALUES(?,?,?,?,?,?,?)",
+                         (session_id, sender, role, content, now(), kind,
+                          json.dumps(payload or {}, ensure_ascii=False)))
+        return int(cur.lastrowid)
 
     def im_messages(self, session_id: str) -> list[dict]:
         return self._all("SELECT * FROM im_message WHERE session_id=? ORDER BY msg_id", (session_id,))
@@ -637,6 +1023,36 @@ class Store:
     def deliverables(self, order_id: str) -> list[dict]:
         return self._all("SELECT * FROM deliverable_doc WHERE order_id=? ORDER BY at", (order_id,))
 
+    def completed_practice_at(self, user_id: str) -> str:
+        """本人两份行后文件都已提交的最近完成时间，与平台阶段和覆盖率独立。"""
+        from ..contracts.deliverables_spec import PRACTICE_FINAL_CODES, resolve
+        required = [resolve(code).id for code in PRACTICE_FINAL_CODES]
+        row = self._one("SELECT MAX(completed_at) AS at FROM ("
+                        "SELECT d.order_id, MAX(d.at) AS completed_at FROM deliverable_doc d "
+                        "JOIN biz_order o ON o.order_id=d.order_id WHERE o.user_id=? "
+                        "AND d.deliverable_id IN (?,?) GROUP BY d.order_id "
+                        "HAVING COUNT(DISTINCT d.deliverable_id)=?)",
+                        (user_id, *required, len(required)))
+        return str((row or {}).get("at") or "")
+
+    def deliverable_draft(self, order_id: str, deliverable_id: str) -> dict | None:
+        return self._one("SELECT * FROM deliverable_draft WHERE order_id=? AND deliverable_id=?",
+                         (order_id, deliverable_id))
+
+    def save_deliverable_drafts(self, order_id: str, drafts: dict[str, dict], validations: dict | None = None) -> list[str]:
+        saved = []
+        with self._lock, self._conn:
+            for did, values in drafts.items():
+                if self._conn.execute("SELECT 1 FROM deliverable_doc WHERE order_id=? AND deliverable_id=?",
+                                      (order_id, did)).fetchone():
+                    continue
+                self._conn.execute("INSERT OR REPLACE INTO deliverable_draft "
+                                   "(order_id,deliverable_id,values_json,updated_at,validation_json) VALUES(?,?,?,?,?)",
+                                   (order_id, did, json.dumps(values, ensure_ascii=False), now(),
+                                    json.dumps((validations or {}).get(did) or {}, ensure_ascii=False)))
+                saved.append(did)
+        return saved
+
     def save_file(self, file_id: str, order_id: str, deliverable_id: str, filename: str,
                   mime: str, size: int, data: bytes) -> None:
         self._exec("INSERT OR REPLACE INTO deliverable_file(file_id, order_id, deliverable_id, filename,"
@@ -724,3 +1140,4 @@ class Store:
             except Exception:
                 out[r["kind"]] = {}
         return out
+

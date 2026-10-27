@@ -13,12 +13,14 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
+import re
 
 from typing import TYPE_CHECKING
 
 from .base import BaseAgent
 from .llm import DeepSeekClient
+from ..contracts.entry_documents import FOREIGN_DOCUMENTS, HK_MACAO_DOCUMENT, TAIWAN_DOCUMENT
 
 if TYPE_CHECKING:   # 只用于类型标注：避免与 services 循环导入
     from ..services.learner_brief import LearnerBrief
@@ -26,32 +28,32 @@ if TYPE_CHECKING:   # 只用于类型标注：避免与 services 循环导入
 # 客源地 -> (语言, 常用入境证件, 复杂度档)
 SOURCE_MARKETS: dict[str, tuple[str, str, int]] = {
     # 0–1 档：中文客源，沟通门槛最低（补救分支用）
-    "香港": ("中文", "港澳居民来往内地通行证（回乡证）", 0),
-    "澳门": ("中文", "港澳居民来往内地通行证（回乡证）", 0),
-    "台湾": ("中文", "台湾居民来往大陆通行证（台胞证）", 0),
-    "新加坡": ("中文", "新加坡普通护照（免签入境）", 1),
-    "马来西亚": ("中文", "马来西亚普通护照（免签入境）", 1),
+    "香港": ("中文", HK_MACAO_DOCUMENT, 0),
+    "澳门": ("中文", HK_MACAO_DOCUMENT, 0),
+    "台湾": ("中文", TAIWAN_DOCUMENT, 0),
+    "新加坡": ("中文", FOREIGN_DOCUMENTS, 1),
+    "马来西亚": ("中文", FOREIGN_DOCUMENTS, 1),
     # 2 档：近程外语客源
-    "日本": ("日本語", "日本护照（免签入境）", 2),
-    "韩国": ("한국어", "韩国护照（需办理签证）", 2),
-    "泰国": ("ไทย", "泰国普通护照（免签入境）", 2),
-    "越南": ("Tiếng Việt", "越南普通护照（签证要求按当期官方政策核验）", 2),
-    "印度尼西亚": ("Bahasa Indonesia", "印度尼西亚普通护照（签证要求按当期官方政策核验）", 2),
+    "日本": ("日本語", FOREIGN_DOCUMENTS, 2),
+    "韩国": ("한국어", FOREIGN_DOCUMENTS, 2),
+    "泰国": ("ไทย", FOREIGN_DOCUMENTS, 2),
+    "越南": ("Tiếng Việt", FOREIGN_DOCUMENTS, 2),
+    "印度尼西亚": ("Bahasa Indonesia", FOREIGN_DOCUMENTS, 2),
     # 3 档：远程英语客源
-    "美国": ("English", "美国普通护照（需办理签证）", 3),
-    "英国": ("English", "英国普通护照（需办理签证）", 3),
-    "澳大利亚": ("English", "澳大利亚普通护照（需办理签证）", 3),
+    "美国": ("English", FOREIGN_DOCUMENTS, 3),
+    "英国": ("English", FOREIGN_DOCUMENTS, 3),
+    "澳大利亚": ("English", FOREIGN_DOCUMENTS, 3),
     # 4 档：小语种 / 高文化复杂度（宗教、礼仪、支付红线密集）
-    "德国": ("Deutsch", "德国普通护照（需办理签证）", 4),
-    "法国": ("Français", "法国普通护照（需办理签证）", 4),
-    "沙特阿拉伯": ("العربية", "沙特普通护照（需办理签证）", 4),
-    "印度": ("English", "印度普通护照（需办理签证）", 4),
-    "西班牙": ("Español", "西班牙普通护照（签证要求按当期官方政策核验）", 4),
-    "墨西哥": ("Español", "墨西哥普通护照（签证要求按当期官方政策核验）", 4),
-    "俄罗斯": ("Русский", "俄罗斯普通护照（签证要求按当期官方政策核验）", 4),
-    "意大利": ("Italiano", "意大利普通护照（签证要求按当期官方政策核验）", 4),
-    "巴西": ("Português", "巴西普通护照（签证要求按当期官方政策核验）", 4),
-    "土耳其": ("Türkçe", "土耳其普通护照（签证要求按当期官方政策核验）", 4),
+    "德国": ("Deutsch", FOREIGN_DOCUMENTS, 4),
+    "法国": ("Français", FOREIGN_DOCUMENTS, 4),
+    "沙特阿拉伯": ("العربية", FOREIGN_DOCUMENTS, 4),
+    "印度": ("English", FOREIGN_DOCUMENTS, 4),
+    "西班牙": ("Español", FOREIGN_DOCUMENTS, 4),
+    "墨西哥": ("Español", FOREIGN_DOCUMENTS, 4),
+    "俄罗斯": ("Русский", FOREIGN_DOCUMENTS, 4),
+    "意大利": ("Italiano", FOREIGN_DOCUMENTS, 4),
+    "巴西": ("Português", FOREIGN_DOCUMENTS, 4),
+    "土耳其": ("Türkçe", FOREIGN_DOCUMENTS, 4),
 }
 
 # 客源语言（前端"客源语言"下拉用同一份口径；一个语言可能对应多个国家）
@@ -139,9 +141,14 @@ class TouristSpec:
     rationale: str = ""
     source_complexity: int = 0
     dispatch_gap: int = 0
+    # 附加标记（标准案例/演示数据用）：并入 payload，不改动既有字段语义
+    extra: dict = field(default_factory=dict)
 
     def to_payload(self) -> dict:
-        return {k: v for k, v in asdict(self).items() if v not in ("", (), None)}
+        out = {k: v for k, v in asdict(self).items()
+               if k != "extra" and v not in ("", (), None, {})}
+        out.update(self.extra or {})
+        return out
 
 
 SYSTEM = """你是携程定制游平台的派单系统，要把一条新需求派给某位定制师。
@@ -153,7 +160,8 @@ SYSTEM = """你是携程定制游平台的派单系统，要把一条新需求�
 
 【你必须按下面的口径生成，不能自行调整难度】
 1. **客源地只能从这几地选**：{markets}{lang_hint}
-   —— 档位越高，语言与文化复杂度越高；语言、证件必须与该客源地匹配。
+   —— 档位越高，语言与文化复杂度越高；语言与客源地匹配。
+   证件类型仅作身份参考，客源地不自动证明国籍、已持有证件或免签资格；不编造签证办理状态。
 2. **派单信息只给 {given} 项**，其余留空（""）。可填项：出行人构成 party / 出行日期 dates /
    天数 days / 预算口径 budget / 交通偏好 transport / 住宿标准 hotel / 特殊需求 special / 决策人 decision。
    留空越多，这位定制师越要自己打电话问出来。
@@ -253,14 +261,21 @@ class DispatchGenerator(BaseAgent):
         for k in allowed:
             if not keep.get(k) and k in fill:
                 keep[k] = fill[k]
+        from ..services.customer_card import date_span_days
+        span = date_span_days(keep.get("dates", ""))
+        declared_days = re.search(r"\d+", keep.get("days", ""))
+        if span is not None and declared_days and int(declared_days.group()) != span:
+            return None
         name = str(data.get("customer") or "").strip()
         if not name.startswith("客户"):
             name = f"客户 {_LETTERS[seq % len(_LETTERS)]}"
         return TouristSpec(
             customer=name,
             source_market=market, language=lang, destination=dest, documents=docs,
-            intent=str(data.get("intent") or ""),
+            intent="",
             personality=str(data.get("personality") or ""),
+            extra={"customer_answers": {key: str(data.get(key) or "").strip()
+                                         for key, _ in DISPATCH_FIELDS if key not in allowed}},
             **keep,
         )
 
@@ -288,8 +303,7 @@ class DispatchGenerator(BaseAgent):
         return TouristSpec(
             customer=f"客户 {_LETTERS[seq % len(_LETTERS)]}",
             source_market=market, language=lang, destination=dest, documents=docs,
-            intent=VAGUE_INTENT[min(brief.knobs["demand_vagueness"], 4)].format(
-                dest=dest, party=keep.get("party") or "一家人"),
+            intent="",  # 派单落库后统一从客户事实卡渲染。
             personality=EMOTION_TRAITS[min(brief.knobs["emotion_intensity"], 4)],
             **keep,
         )
@@ -342,3 +356,62 @@ def missing_fields(payload: dict) -> list[str]:
     """派单信息里还缺哪些字段（首呼要补问的就是这些）。"""
     return [label for key, label in DISPATCH_FIELDS
             if not str(payload.get(key) or "").strip()]
+
+
+# ---------------------------------------------------------------- 标准案例（确定性）
+
+DEMO_LABEL = "标准案例/演示数据"
+SCENARIO_PAYLOAD_KEYS = ("scenario_id", "scenario_label", "demo_data", "fixed_dates")
+
+
+def spec_from_case(case: dict) -> TouristSpec:
+    """把标准案例的固定资料转成派单规范（**确定性**：同一份案例永远得到同一份 spec）。
+
+    与 `DispatchGenerator` 的区别：这里不做随机、不调模型、不按画像调难度。
+    案例里声明的客源地/目的地/语言/证件必须与 `SOURCE_MARKETS` 口径一致，
+    不一致就报错而不是"就近改一下"——标准案例的可复现性优先于容错。
+    """
+    tourist = (case or {}).get("tourist") or {}
+    market = str(tourist.get("source_market") or "").strip()
+    if market not in SOURCE_MARKETS:
+        raise ValueError(f"标准案例的客源地不在契约口径内: {market!r}")
+    dest = str(tourist.get("destination") or "").strip().rstrip("省市")
+    if dest not in DESTINATIONS:
+        raise ValueError(f"标准案例的目的地不在契约口径内: {dest!r}")
+    lang, docs, complexity = SOURCE_MARKETS[market]
+    declared_lang = str(tourist.get("language") or lang).strip()
+    if declared_lang and declared_lang != lang:
+        raise ValueError(f"标准案例语言 {declared_lang!r} 与客源地 {market} 的口径 {lang!r} 不一致")
+    declared_docs = str(tourist.get("documents") or docs).strip()
+    preset = tuple(tourist.get("preset_incidents") or ())
+    try:
+        fc_limit = int(tourist.get("first_call_limit_min") or 60)
+    except (TypeError, ValueError):
+        fc_limit = 60
+
+    extra = {
+        "scenario_id": str(case.get("case_id") or ""),
+        "scenario_label": str(case.get("demo_label") or DEMO_LABEL),
+        "demo_data": True,
+    }
+    return TouristSpec(
+        customer=str(tourist.get("customer") or "客户"),
+        source_market=market, language=lang, destination=dest, documents=declared_docs,
+        party=str(tourist.get("party") or ""),
+        dates=str(tourist.get("dates") or ""),
+        days=str(tourist.get("days") or ""),
+        budget=str(tourist.get("budget") or ""),
+        transport=str(tourist.get("transport") or ""),
+        hotel=str(tourist.get("hotel") or ""),
+        special=str(tourist.get("special") or ""),
+        decision=str(tourist.get("decision") or ""),
+        intent=str(tourist.get("intent") or ""),
+        personality=str(tourist.get("personality") or ""),
+        first_call_limit_min=fc_limit,
+        preset_incidents=preset,
+        difficulty_label=str(tourist.get("difficulty_label") or ""),
+        rationale=str(tourist.get("rationale") or ""),
+        source_complexity=int(tourist.get("source_complexity") or complexity),
+        dispatch_gap=int(tourist.get("dispatch_gap") or 0),
+        extra=extra,
+    )

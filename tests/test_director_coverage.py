@@ -39,10 +39,18 @@ def seed_baseline(store, passed: bool = True, agreement: float = 0.94,
 
 
 def unlock(store, practice, order_id, *kinds):
-    """D-059：事件只落在真实存在的会话里——先在资源大群加好友，事件才有地方发生。"""
-    from tripcraft.services.supplier_service import SupplierService
+    """事件只落在真实存在的会话里；城市资源先由地接确认本单资源池。"""
+    from tripcraft.services.supplier_service import SupplierService, destination_city
     svc = SupplierService(store, practice=practice)
-    svc.ensure_hub("u-demo")
+    resource_kinds = [k for k in kinds if k in ("酒店", "车队", "导游", "司机")]
+    if "地接社" in kinds or resource_kinds:
+        try:
+            svc.add_contact(order_id, "地接社")
+        except ValueError:
+            pass
+    if resource_kinds:
+        DirectorService(store=store, practice=practice).materialize_resource_pool(
+            order_id, "测试资源需求", resource_kinds, destination_city(store.order(order_id)), "")
     for kind in kinds:
         try:
             svc.add_contact(order_id, kind)
@@ -141,17 +149,21 @@ def test_thresholds_come_from_calibration_when_available():
     assert "经验" in th2["source"]
 
 
-def test_low_coverage_defers_profile_write():
+def test_low_coverage_still_writes_assessed_profile_points():
     store, practice, _ = make()
     practice.record_evidence(ORDER, "\u884c\u7a0b\u65b9\u6848", "\u65b9\u6848\u6b63\u6587")
-    report = practice.score_order(ORDER, ScoreFakeLLM())
+    report = practice.score_order(ORDER, ScoreFakeLLM(score=85, confidence=0.99))
     assert report["ok"] and report["scored"] > 0, "\u5df2\u8986\u76d6\u7684\u70b9\u5e94\u8be5\u80fd\u8bc4\u51fa\u5206"
     assert report["coverage"]["passed"] is False
-    assert report["deferred"] is True
-    assert report["written"] == 0
-    assert "\u4e0d\u5199\u753b\u50cf" in report["deferred_reason"]
-    # 画像没被误改
-    assert not any((r.get("real_v") or 0) > 0 for r in store.abilities("u-demo").values())
+    assert report["deferred"] is False
+    assert report["written"] == report["scored"] > 0
+    assert not report["deferred_reason"]
+    written = {item["skill_point_id"] for item in report["skill_points"]}
+    covered = {item["skill_point_id"] for item in practice.coverage(ORDER)["items"] if item["covered"]}
+    assert written <= covered
+    abilities = store.abilities("u-demo")
+    assert all(abilities[sp]["real_v"] == 85 for sp in written)
+    assert all(not row["real_v"] for sp, row in abilities.items() if sp not in written)
 
 
 def test_full_coverage_writes_profile():
@@ -287,13 +299,15 @@ def test_actions_auto_inject_without_manual_button():
     """学员动作自动进总线并注入事件——不需要在界面上手动点「事件注入」。"""
     store, practice, director = make()
     practice.attach_director(director)
-    practice.record_action(ORDER, "grab")
-    practice.record_action(ORDER, "first_call")
-    out = practice.record_action(ORDER, "deliverable:需求确认单")
+    oid = "auto-incident-order"
+    store.upsert_order(oid, "u-demo", "客户 Z", "江苏", "正常", 0, payload={"brief": {}})
+    practice.record_action(oid, "grab")
+    practice.record_action(oid, "first_call")
+    out = practice.record_action(oid, "deliverable:需求确认单")
     inc = out["incident"]
     assert inc, "投递需求确认单应触发注入"
     assert inc["skill_points"]
-    events = [e["type"] for e in store.events(ORDER)]
+    events = [e["type"] for e in store.events(oid)]
     assert "requirement_confirmed" in events
 
 

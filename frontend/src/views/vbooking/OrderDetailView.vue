@@ -1,11 +1,26 @@
 <template>
   <div class="vb">
     <div class="vb-crumb">
-      <span class="lnk" @click="router.push('/practice')">订单管理</span> &gt; 订单详情 &gt;
+      <span class="lnk" @click="router.push('/practice')">订单管理</span> &gt;
+      <span class="lnk" @click="router.push(`/practice/orders/${orderId}`)">订单详情</span> &gt;
       <span class="mono">{{ orderId }}</span>
     </div>
 
-    <div class="vb-body">
+    <!-- 订单加载失败：给错误原因 + 重试，不再显示空白骨架 -->
+    <div v-if="orderError" class="card sec err-card" data-testid="order-error">
+      <div class="err-title"><SIcon name="warn" :size="15" /> 订单加载失败</div>
+      <div class="err-msg">{{ orderError }}</div>
+      <div class="err-foot">
+        <button class="tc-btn ghost" @click="router.push('/practice')">
+          <SIcon name="back" :size="14" /> 返回订单管理
+        </button>
+        <button class="tc-btn" @click="loadOrder">
+          <SIcon name="refresh" :size="14" /> 重试
+        </button>
+      </div>
+    </div>
+
+    <div v-else class="vb-body">
       <!-- 左主区 -->
       <section class="main-col">
         <div class="card head">
@@ -16,8 +31,14 @@
             <div class="row"><span class="k">客源地</span><span class="v">{{ order?.source_market || '—' }}<span class="src-tag">入境接待</span></span></div>
           </div>
           <div class="head-right">
-            <button class="tc-btn head-cta" @click="openWorkbench()">
-              <SIcon name="filetext" :size="15" /> 产出与投递
+            <!-- 入口落到「当前阶段」：优先按 journey 给的下一步交付物打开，没有就按本阶段第一份文档 -->
+            <button class="tc-btn head-cta" data-testid="workbench-cta"
+              @click="openWorkbench(nextAction?.deliverable || currentDocCode)">
+              <SIcon name="filetext" :size="15" /> 文件夹
+            </button>
+            <button class="tc-btn ghost head-cta" data-testid="order-score-cta"
+              @click="router.push(`/practice/orders/${orderId}/score`)">
+              <SIcon name="chart" :size="15" /> 评分复盘
             </button>
           </div>
         </div>
@@ -37,11 +58,9 @@
           <div class="sec-title title-rule"><span>基础信息</span></div>
           <div class="grid2">
             <div class="row"><span class="k">服务语言</span><span class="v">{{ order?.language || '中文' }}</span></div>
-            <div class="row"><span class="k">商家服务人员</span><span class="v">定制师 · {{ user.consultantName }}<template v-if="user.companyName"> · {{ user.companyName }}</template></span></div>
+            <div class="row"><span class="k">商家服务人员</span><span class="v">定制师 · {{ user.consultantName }}</span></div>
           </div>
           <div class="row mt"><span class="k">入境证件</span><span class="v">{{ order?.documents || '—' }}</span></div>
-          <div class="row mt"><span class="k">用户信息备注</span>
-            <span class="v muted">客户希望行程轻松，带一位老人；预算偏紧【可编辑】</span></div>
         </div>
 
         <div v-if="order?.dispatch" class="card tl">
@@ -54,6 +73,68 @@
             <Countdown :until="order.dispatch.plan.due_at" prefix="方案时限剩" />
           </template>
           <span v-if="order.dispatch.lost" class="tl-lost">{{ order.dispatch.lost_reason }}</span>
+        </div>
+
+        <!-- 六阶段文档入口：阶段分区 + 当前阶段置顶 + 该阶段唯一主动作（R01） -->
+        <div class="card sec" data-testid="stage-docs">
+          <div class="sec-title title-rule">
+            <span>订单工作流</span>
+            <span class="dw-stat">
+              <b>{{ stepDone }}</b> / {{ stepTotal }} 步完成
+            </span>
+          </div>
+
+          <div v-if="journeyError" class="err-inline" data-testid="journey-error">
+            <span class="err-msg">{{ journeyError }}</span>
+            <button class="tc-btn ghost sm" :disabled="journeyLoading" @click="refreshJourney()">
+              <SIcon name="refresh" :size="13" /> {{ journeyLoading ? '重试中…' : '重试' }}
+            </button>
+          </div>
+
+          <div v-if="journeyLoading && !availableStages.length" class="doc-empty">流程进度加载中…</div>
+          <div v-else-if="!availableStages.length" class="doc-empty">暂无流程进度数据</div>
+
+          <div v-else class="stage-list">
+            <div v-for="s in availableStages" :key="s.id" class="stage-row"
+              :class="[s.state, { first: s.id === currentStageId, folded: !isExpanded(s) }]"
+              :data-testid="`stage-${s.id}`" :data-stage-state="s.state">
+              <button class="st-head" type="button" :aria-expanded="isExpanded(s)"
+                @click="toggleStage(s)">
+                <span class="st-name">{{ s.name }}</span>
+                <span class="st-state" :class="s.state">{{ STATE_LABEL[s.state] || s.state }}</span>
+                <span class="st-step">{{ s.done_count }}/{{ s.total_count }}</span>
+                <span class="st-chev" :class="{ open: isExpanded(s) }"><SIcon name="right" :size="13" /></span>
+              </button>
+              <template v-if="isExpanded(s)">
+                <!-- 当前阶段唯一主动作：文案取自 journey 的 next_action（不在前端另写一份动作表） -->
+                <div v-if="s.id === currentStageId" class="na" data-testid="next-action">
+                  <div class="na-txt">
+                    <span v-if="nextAction" class="na-label">当前步骤 · {{ nextAction.label }}</span>
+                    <span v-else class="na-label">本单流程已全部完成</span>
+                  </div>
+                  <!-- 当前阶段唯一主动作：「继续」直接走 journey 给的下一步路由 -->
+                  <button v-if="nextAction" class="tc-btn na-go" data-testid="next-action-go"
+                    @click="continueNext">
+                    <SIcon name="right" :size="14" /> 继续
+                  </button>
+                </div>
+
+                <div v-if="(s.substeps || []).length" class="doc-list">
+                  <button v-for="sub in s.substeps" :key="sub.id" class="doc-row step-row"
+                    :class="{ done: sub.done, current: sub.state === 'current' }" type="button"
+                    :data-testid="`step-${sub.id}`"
+                    @click="goStep(sub)">
+                    <span class="dr-ic"><SIcon :name="sub.done ? 'check' : 'right'" :size="13" /></span>
+                    <span class="step-mid"><span class="dr-name">{{ sub.name }}</span></span>
+                    <span v-if="docTagOf(s, sub)" class="dr-tag">{{ docTagOf(s, sub) }}</span>
+                    <span v-if="sub.done" class="dr-done">已完成</span>
+                    <span class="dr-go">进入</span>
+                  </button>
+                </div>
+                <div v-else class="doc-empty">本阶段暂无步骤</div>
+              </template>
+            </div>
+          </div>
         </div>
 
         <div class="card sec">
@@ -76,10 +157,10 @@
                 <span v-if="p.feedback" class="p-fb">客户反馈：{{ p.feedback }}</span>
               </div>
               <span class="p-tag" :class="planClass(p)">{{ p.status }}</span>
-              <button v-if="p.status === '草稿'" class="tc-btn ghost p-btn"
-                @click="router.push(`/practice/orders/${orderId}/plan/new?plan=${p.plan_id}`)">继续编辑</button>
-              <button v-else class="tc-btn ghost p-btn"
-                @click="router.push(`/practice/orders/${orderId}/plan/new?plan=${p.plan_id}`)">查看</button>
+              <button v-if="p.status === '草稿'" class="tc-btn ghost p-btn" @click="editPlan(p.plan_id)">
+                继续编辑
+              </button>
+              <button v-else class="tc-btn ghost p-btn" @click="editPlan(p.plan_id)">查看</button>
             </div>
             <div class="plan-foot">
               <button class="tc-btn" @click="createPlan">创建新版本</button>
@@ -91,41 +172,8 @@
         </div>
 
         <div class="card sec">
-          <div class="sec-title title-rule">
-            <span>产出与投递</span>
-            <span class="dw-stat"><b>{{ deliveredCount }}</b> / {{ deliverables.length }} 份已投递</span>
-          </div>
-          <div class="dw-docs">
-            <button v-for="d in deliverables" :key="d.code" class="dw-doc" :class="{ done: d.submitted }"
-              @click="openWorkbench(d.code)">
-              <span class="dd-ic"><SIcon :name="d.submitted ? 'check' : 'filetext'" :size="13" /></span>
-              <span class="dd-mid">
-                <span class="dd-name">{{ d.title }}</span>
-                <span class="dd-meta">{{ d.step }} · {{ d.audience.join('、') }}</span>
-              </span>
-              <span class="dd-tag">{{ d.submitted ? 'V' + d.version + ' 已投递' : '未填写' }}</span>
-            </button>
-          </div>
-          <div class="dw-foot">
-            <span class="dw-tip">填完提交即投递：发给客户 / 地接 / 司导的会进对应群聊，内部台账只留档。</span>
-            <button class="tc-btn" @click="openWorkbench()">
-              <SIcon name="right" :size="14" /> 进入产出与投递
-            </button>
-          </div>
-        </div>
-
-        <div class="card sec">
           <div class="sec-title title-rule"><span>订单跟进信息</span></div>
-          <div class="alert">
-            合规要求：按照员工所属企业合规要求，目的地不支持国际、中国香港、中国台湾、中国澳门。
-          </div>
-          <div class="guide">
-            客人还未阅读过任何方案，还有机会争取到用户，可需尽快发送方案吸引用户。
-          </div>
-          <div class="note-row">
-            <button class="tc-btn ghost">添加跟进备注</button>
-            <span class="note-tip">请严格遵循流程规则进行报备，<span class="lnk">查看备注规则</span></span>
-          </div>
+          <div v-if="order?.hint" class="guide">{{ order.hint }}</div>
           <div v-if="order?.dispatch?.plan" class="pause">
             方案最晚发送时间：
             <Countdown :until="order.dispatch.plan.due_at" prefix="剩" />
@@ -139,7 +187,11 @@
                 <td class="mono">{{ r.time }}</td>
                 <td><span class="tag" :class="r.status.includes('已接通') || r.status.includes('已添加') ? 'ok' : 'bad'">{{ r.status }}</span></td>
                 <td>{{ r.detail || '—' }}</td>
-                <td><span v-if="r.has_record" class="lnk">录音</span><span v-else class="muted">—</span></td>
+                <td>
+                  <button v-if="r.has_record" class="lnk" type="button" data-testid="record-link"
+                    @click="openCall">录音</button>
+                  <span v-else class="muted">—</span>
+                </td>
               </tr>
               <tr v-if="!contacts.length"><td colspan="4" class="muted">暂无联系记录</td></tr>
             </tbody>
@@ -168,16 +220,14 @@
               </div>
             </div>
           </div>
-          <button class="tc-btn ghost full">取消订单</button>
         </div>
 
         <div class="card sec">
-          <div class="sec-title title-rule"><span>信息</span></div>
-          <div class="info-row"><span class="k">是否真需求单</span><span class="v muted">未判断</span></div>
-          <div class="info-note">请及时添加跟进备注完成是否真需求单的判断</div>
-          <div class="info-row"><span class="k">是否添加企微</span><span class="v muted">否</span></div>
-          <div class="info-row"><span class="k">是否建立售前微信群</span><span class="v muted">否</span></div>
-          <div class="lnk">点击查看建群流程和相关话术</div>
+          <div class="sec-title title-rule"><span>客户与订单</span></div>
+          <div class="info-row"><span class="k">客户</span><span class="v">{{ order?.customer || '—' }}</span></div>
+          <div class="info-row"><span class="k">客源地</span><span class="v">{{ order?.source_market || '—' }}</span></div>
+          <div class="info-row"><span class="k">目的地</span><span class="v">{{ order?.destination || '—' }}</span></div>
+          <div class="info-row"><span class="k">订单状态</span><span class="v">{{ order?.status || '—' }}</span></div>
         </div>
       </aside>
     </div>
@@ -190,36 +240,65 @@ import { useRoute, useRouter } from 'vue-router'
 import SIcon from '@/components/SIcon.vue'
 import Countdown from '@/components/Countdown.vue'
 import client from '@/api/client'
-
-const HINTS = [
-  '尽快首呼，挖清人数/日期/预算口径（1 小时内）',
-  '创建并发送方案（4 小时内）',
-  '跟进客户确认方案',
-  '准备并发送合同',
-  '跟进客户确认合同',
-  '行前准备：锁定资源、发出团通知',
-  '核对地接结算单，提交结算',
-  '回访客户，记录利润与复盘',
-]
+import { useJourney } from '@/composables/useJourney'
 import { useUserStore } from '@/stores/user'
 import { usePracticeStore } from '@/stores/practice'
+import {
+  countDelivered,
+  countDocs,
+  currentStageDocCode,
+  orderStagesForDisplay,
+  workbenchRoute,
+} from './orderDetailDocs'
 
 const route = useRoute()
 const router = useRouter()
 const orderId = computed(() => String(route.params.id || ''))
 const user = useUserStore()
 const practice = usePracticeStore()
-practice.setActiveOrder(String(route.params.id || ''))
+practice.setActiveOrder(orderId.value)
+
 const order = ref<any>(null)
+const orderError = ref('')
 const rawSteps = ref<any[]>([])
 const steps = computed(() => rawSteps.value)
-
 const contacts = computed<any[]>(() => order.value?.contacts || [])
-const gate = ref<any>(null)
 const plans = ref<any[]>([])
-const deliverables = ref<any[]>([])
-const deliveredCount = computed(() => deliverables.value.filter((d) => d.submitted).length)
 const unreadPlans = computed(() => plans.value.filter((p) => p.status === '已发送' && !p.read).length)
+
+// 阶段、阶段状态与唯一下一步动作全部来自 journey 投影（口径来源：tripcraft/contracts/stages.py）
+const {
+  loading: journeyLoading,
+  error: journeyError,
+  stages,
+  currentStageId,
+  nextAction,
+  refresh: refreshJourney,
+} = useJourney(orderId)
+
+const STATE_LABEL: Record<string, string> = { done: '已完成', current: '进行中', todo: '未开始' }
+
+/** 当前阶段在最前，其余按契约 order 排（行前 1 → 行后） */
+const availableStages = computed(() => orderStagesForDisplay(stages.value, currentStageId.value))
+
+/** 工作流折叠：默认只展开当前阶段，其余阶段折叠；点阶段头可切换 */
+const expandedStages = ref<Record<string, boolean>>({})
+function isExpanded(s: any) { return !!expandedStages.value[s.id] }
+function toggleStage(s: any) {
+  expandedStages.value = { ...expandedStages.value, [s.id]: !isExpanded(s) }
+}
+watch(currentStageId, (id) => {
+  if (id) expandedStages.value = { ...expandedStages.value, [id]: true }
+}, { immediate: true })
+
+const totalDocs = computed(() => countDocs(stages.value))
+const deliveredCount = computed(() => countDelivered(stages.value))
+const stepTotal = computed(() => stages.value.reduce((a, s) => a + (s.substeps?.length || 0), 0))
+const stepDone = computed(() => stages.value.reduce((a, s) => a + (s.substeps || []).filter((x: any) => x.done).length, 0))
+
+/** 当前阶段的定位交付物 code：先取未投递的那份，工作台据此直接打开 */
+const currentStage = computed(() => stages.value.find((s) => s.id === currentStageId.value) || null)
+const currentDocCode = computed(() => currentStageDocCode(currentStage.value))
 
 function planClass(p: any) {
   if (p.status === '客户已确认') return 'ok'
@@ -233,73 +312,63 @@ async function loadPlans() {
   catch { plans.value = [] }
 }
 
-async function loadDeliverables() {
-  try {
-    deliverables.value = (await client.get(`/practice/orders/${orderId.value}/deliverables`)).data.deliverables || []
-  } catch { deliverables.value = [] }
-}
-
-/** 统一入口：不传 code 就自动落到第一份没填的交付物，省一步选择 */
+/** 进入文档提交页：带交付物 code，工作台据此直接打开对应文档 */
 function openWorkbench(code = '') {
-  const target = code || (deliverables.value.find((d) => !d.submitted) || {}).code || ''
-  router.push(`/practice/orders/${orderId.value}/deliverables${target ? '?code=' + target : ''}`)
+  if (code === 'itinerary') { router.push(`/practice/orders/${orderId.value}/plan/new`); return }
+  router.push(workbenchRoute(orderId.value, code))
+}
+function openDoc(code: string) {
+  if (code) openWorkbench(code)
+}
+function goStep(sub: any) { if (sub?.route) router.push(sub.route) }
+function docTagOf(stage: any, sub: any) {
+  const code = String(sub?.deliverable || '')
+  if (!code) return ''
+  const d = (stage?.deliverables || []).find((x: any) => x.code === code)
+  if (!d) return ''
+  return d.submitted ? `V${d.version} 已投递` : '未投递'
+}
+/** 当前阶段的唯一主动作：直接走 journey 给的下一步路由，不在前端另排一份跳转表 */
+function continueNext() {
+  const to = nextAction.value?.route
+  if (to) router.push(to)
+}
+function startCall() { router.push(`/practice/orders/${orderId.value}/call`) }
+function openCall() { startCall() }
+function createPlan() { router.push(`/practice/orders/${orderId.value}/plan/new`) }
+/** 打开某一份方案：PlanNewView 按 ?plan= 定位版本，不带就只会落到最后一份草稿 */
+function editPlan(planId: string) {
+  router.push(`/practice/orders/${orderId.value}/plan/new?plan=${planId}`)
 }
 
-async function loadGate() {
-  try { gate.value = (await client.get(`/practice/orders/${orderId.value}/gates`)).data } catch {}
-  await loadPlans()
-}
-
-const DOC_MAP: Record<string, string> = {
-  'deliverable:需求确认单': 'requirement_sheet',
-  'deliverable:行程方案': 'itinerary',
-  'deliverable:分项报价': 'quotation',
-  'guard_pass:分项报价': 'quotation',
-  'deliverable:合同与保险': 'contract',
-  'deliverable:出团通知书': 'departure_notice',
-  'deliverable:地接结算核对单': 'settlement',
-  'deliverable:回访与复盘记录': 'review',
-}
-function docCode(action: string) { return DOC_MAP[action] || '' }
-function openDoc(action: string) {
-  router.push(`/practice/orders/${orderId.value}/deliverables?code=${docCode(action)}`)
-}
-
-async function doAction(action: string) {
-  try {
-    await client.post(`/practice/orders/${orderId.value}/actions`, { action })
-    await Promise.all([load(), loadGate()])
-  } catch (e: any) {
-    alert(e?.response?.data?.detail || '操作失败')
-  }
-}
-
-async function load() {
+async function loadOrder() {
   const id = orderId.value
+  orderError.value = ''
   try {
     const o = await client.get(`/practice/orders/${id}`)
     order.value = o.data
     rawSteps.value = (o.data.steps || []).map((s: any) => ({
-      label: s.label, state: s.state, note: s.note || undefined, urgent: !!s.urgent,
+      label: s.label, state: s.state, note: s.note || undefined,
+      urgent: !!s.urgent, deadline_at: s.deadline_at || '',
     }))
-    loadGate()
-    loadDeliverables()
-  } catch { order.value = null }
+    loadPlans()
+  } catch (e: any) {
+    order.value = null
+    rawSteps.value = []
+    plans.value = []
+    orderError.value = e?.response?.data?.detail
+      || (e?.response ? '订单详情读取失败，请重试' : '订单详情加载失败，请检查网络后重试')
+  }
 }
 
-function startCall() { router.push(`/practice/orders/${orderId.value}/call`) }
-
-function createPlan() { router.push(`/practice/orders/${orderId.value}/plan/new`) }
-
-onMounted(load)
+onMounted(loadOrder)
 // 同一个组件实例在不同订单之间复用时，必须重新拉数据（hash 路由不会重建组件）
 watch(orderId, () => {
   practice.setActiveOrder(orderId.value)
   order.value = null
-  gate.value = null
   rawSteps.value = []
-  deliverables.value = []
-  load()
+  plans.value = []
+  loadOrder()
 })
 </script>
 
@@ -327,22 +396,6 @@ watch(orderId, () => {
 .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 20px; }
 .src-tag { margin-left: 8px; font-size: 14.5px; background: #efe9fe; color: #7a5af8; border-radius: 4px; padding: 1px 7px; }
 
-.gate { display: flex; flex-direction: column; gap: 4px; }
-.g-top { display: flex; align-items: baseline; gap: 10px; }
-.g-stage { font-size: 15.5px; font-weight: 800; }
-.g-count { font-size: 15.5px; color: $color-primary; background: $color-primary-soft; border-radius: 999px; padding: 2px 10px; }
-.g-hint { font-size: 15.5px; color: $color-text-secondary; margin-bottom: 4px; }
-.g-row { display: flex; align-items: center; gap: 9px; font-size: 15px; padding: 6px 0; border-bottom: 1px dashed #f1f3f5; }
-.g-row:last-of-type { border-bottom: none; }
-.gk { width: 8px; height: 8px; border-radius: 50%; background: #d5dce5; flex-shrink: 0; }
-.g-row.ok .gk { background: #12a76a; }
-.gl { font-weight: 600; color: $color-text-secondary; flex-shrink: 0; }
-.g-row.ok .gl { color: $color-text; }
-.gr { flex: 1; font-size: 15.5px; color: $color-text-muted; }
-.g-btn { padding: 3px 12px; font-size: 15.5px; flex-shrink: 0; }
-.g-next { margin-top: 6px; font-size: 15.5px; color: $color-primary; }
-.g-link { margin-top: 5px; font-size: 15.5px; color: $color-primary; cursor: pointer; }
-.g-link:hover { text-decoration: underline; }
 .tl { display: flex; align-items: center; gap: 10px; padding: 11px 18px; flex-wrap: wrap; }
 .tl-note { font-size: 15.5px; color: $color-text-muted; }
 .tl-lost { font-size: 15.5px; color: #c0392b; }
@@ -366,10 +419,7 @@ watch(orderId, () => {
 .plan-foot { display: flex; align-items: center; gap: 12px; }
 .plan-warn { font-size: 15.5px; color: $color-warning; }
 
-.alert { background: #fdeceb; color: #c0392b; font-size: 15.5px; padding: 9px 12px; border-radius: 6px; margin-bottom: 10px; }
 .guide { background: $color-primary-softer; color: $color-text-secondary; font-size: 15.5px; padding: 9px 12px; border-radius: 6px; margin-bottom: 12px; }
-.note-row { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
-.note-tip { font-size: 15.5px; color: $color-text-muted; }
 .pause { font-size: 15.5px; color: $color-text-secondary; margin-bottom: 14px; }
 .sub-title { font-size: 17px; font-weight: 700; margin-bottom: 8px; }
 
@@ -379,10 +429,10 @@ watch(orderId, () => {
 .tag { display: inline-block; padding: 2px 9px; border-radius: 4px; font-size: 15.5px; }
 .tag.ok { background: #e8f7ee; color: #12a76a; }
 .tag.bad { background: #fdeceb; color: #e04b4b; }
-.lnk { color: $color-primary; cursor: pointer; font-size: 15.5px; }
+.lnk { color: $color-primary; cursor: pointer; font-size: 15.5px; background: none; border: none; padding: 0; font-family: inherit; }
 .lnk:hover { text-decoration: underline; }
 
-.timeline { margin-bottom: 14px; }
+.timeline { margin-bottom: 0; }
 .step { display: flex; gap: 10px; }
 .dot-col { display: flex; flex-direction: column; align-items: center; }
 .dot { width: 10px; height: 10px; border-radius: 50%; background: #cfd6de; margin-top: 3px; }
@@ -395,30 +445,62 @@ watch(orderId, () => {
 .step.current .step-label { color: $color-text; font-weight: 700; }
 .step-note { font-size: 15.5px; margin-top: 3px; }
 .urgent { font-size: 14.5px; background: #e04b4b; color: #fff; border-radius: 8px; padding: 1px 7px; }
-.full { width: 100%; justify-content: center; }
 
 .sec-title { display: flex; align-items: center; gap: 8px; }
 .head-cta { display: inline-flex; align-items: center; gap: 7px; white-space: nowrap; }
 .dw-stat { margin-left: auto; font-size: 14px; font-weight: 500; color: $color-text-secondary; }
 .dw-stat b { font-size: 16px; font-weight: 800; color: $color-primary; }
-.dw-docs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
-.dw-doc { display: flex; align-items: center; gap: 11px; text-align: left; padding: 12px 14px; cursor: pointer;
-  border: 1px solid $color-border; border-radius: $radius-md; background: #fff;
-  transition: border-color .16s ease, box-shadow .16s ease, transform .16s cubic-bezier(.34,1.4,.6,1); }
-.dw-doc:hover { border-color: $color-primary; transform: translateY(-1px); box-shadow: 0 6px 18px rgba(37,119,227,0.12); }
-.dw-doc.done { background: #f6fbf8; border-color: #e2f1e8; }
-.dw-doc.done:hover { border-color: #12a76a; box-shadow: 0 6px 18px rgba(18,167,106,0.12); }
-.dd-ic { width: 26px; height: 26px; flex-shrink: 0; border-radius: 8px; display: flex; align-items: center;
+
+/* ── 六阶段文档入口 ── */
+.stage-list { display: flex; flex-direction: column; gap: 10px; }
+.stage-row { border: 1px solid $color-border; border-radius: $radius-md; padding: 12px 14px; background: #fff; }
+.stage-row.todo { opacity: .72; }
+.stage-row.first { border-color: $color-primary; background: linear-gradient(180deg, #f7fbff, #fff);
+  box-shadow: 0 6px 18px rgba(37,119,227,0.10); opacity: 1; }
+.st-head { display: flex; align-items: baseline; gap: 9px; width: 100%; padding: 0; border: 0;
+  background: none; font-family: inherit; text-align: left; cursor: pointer; }
+.st-chev { margin-left: 4px; display: inline-flex; color: $color-text-muted; transition: transform .16s ease; }
+.st-chev.open { transform: rotate(90deg); }
+.st-name { font-size: 16px; font-weight: 700; }
+.stage-row.first .st-name { color: $color-primary; }
+.st-state { font-size: 13px; border-radius: 999px; padding: 1px 9px; background: #f1f4f8; color: $color-text-muted; }
+.st-state.done { background: #e8f7ee; color: $color-success; }
+.st-state.current { background: $color-primary-soft; color: $color-primary; }
+.st-step { margin-left: auto; font-size: 14px; color: $color-text-muted; }
+.doc-list { margin-top: 10px; display: flex; flex-direction: column; gap: 8px; }
+.na { margin-top: 10px; display: flex; align-items: center; gap: 12px; background: $color-primary-soft;
+  border-radius: 8px; padding: 8px 12px; }
+.na-txt { display: flex; flex-direction: column; gap: 3px; min-width: 0; flex: 1; }
+.na-label { font-size: 15px; font-weight: 700; color: $color-primary; }
+.na-detail { font-size: 14.5px; color: $color-text-secondary; }
+.na-go { flex-shrink: 0; display: inline-flex; align-items: center; gap: 5px; }
+.doc-row { display: flex; align-items: center; gap: 10px; text-align: left; width: 100%; cursor: pointer;
+  border: 1px solid $color-border; border-radius: $radius-md; background: #fff; padding: 9px 12px;
+  font-family: inherit; transition: border-color .16s ease, box-shadow .16s ease, transform .16s ease; }
+.doc-row:hover { border-color: $color-primary; transform: translateY(-1px); box-shadow: 0 6px 18px rgba(37,119,227,0.12); }
+.step-mid { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
+.doc-row.current { border-color: $color-primary; background: $color-primary-soft; }
+.step-row { align-items: flex-start; }
+.step-row .dr-ic { margin-top: 1px; }
+.dr-ic { width: 24px; height: 24px; flex-shrink: 0; border-radius: 8px; display: flex; align-items: center;
   justify-content: center; background: $color-primary-soft; color: $color-primary; }
-.dw-doc.done .dd-ic { background: #e5f7ee; color: #12a76a; }
-.dd-mid { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
-.dd-name { font-size: 15.5px; font-weight: 600; }
-.dd-meta { font-size: 13.5px; color: $color-text-muted; }
-.dd-tag { font-size: 13px; color: $color-text-muted; white-space: nowrap; }
-.dw-doc.done .dd-tag { color: #12a76a; font-weight: 700; }
-.dw-foot { margin-top: 14px; display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
-.dw-tip { font-size: 14px; line-height: 1.6; color: $color-text-muted; }
-.dw-foot .tc-btn { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.dr-name { flex: 1; min-width: 0; font-size: 15.5px; font-weight: 600; }
+.dr-tag { font-size: 13px; color: $color-text-muted; white-space: nowrap; }
+.dr-go { font-size: 14px; color: $color-primary; white-space: nowrap; }
+.dr-done { font-size: 12px; line-height: 1; padding: 3px 8px; border-radius: 999px;
+  background: #e8f7ee; color: #12a76a; font-weight: 600; white-space: nowrap; }
+.doc-empty { margin-top: 8px; font-size: 15px; color: $color-text-muted; }
+
+/* ── 错误态与重试 ── */
+.err-card { border-color: #f3c9c4; }
+.err-title { display: flex; align-items: center; gap: 7px; font-size: 17px; font-weight: 700; color: $color-danger; margin-bottom: 8px; }
+.err-msg { font-size: 15.5px; color: $color-text-secondary; }
+.err-foot { margin-top: 14px; display: flex; gap: 10px; }
+.err-inline { display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  background: #fdf1f0; border-radius: 8px; padding: 9px 12px; margin-bottom: 10px; }
+.err-inline .err-msg { color: $color-danger; }
+.tc-btn.sm { min-height: 32px; padding: 5px 12px; font-size: 14px; }
+
 .call-row { display: flex; align-items: center; gap: 14px; }
 .call-info { flex: 1; }
 .ci-name { font-size: 19px; font-weight: 800; }
@@ -426,5 +508,5 @@ watch(orderId, () => {
 .call-btn { padding: 8px 18px; }
 
 .info-row { display: flex; justify-content: space-between; font-size: 15.5px; margin-bottom: 8px; }
-.info-note { font-size: 15.5px; color: $color-text-muted; background: $color-primary-softer; padding: 8px 10px; border-radius: 6px; margin-bottom: 10px; }
+.info-row:last-child { margin-bottom: 0; }
 </style>

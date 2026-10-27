@@ -43,7 +43,7 @@ TOOLS: tuple[dict, ...] = (
          {"kind": STR, "request": STR}, ["kind", "request"], "supplier"),
     tool("deliverable.push", "把交付物投递给客户，返回客户反馈（会先过双层拦截网）",
          {"kind": STR, "content": STR, "customer": STR, "order_id": ORDER},
-         ["kind", "content"], "deliverable"),
+         ["kind", "content", "order_id"], "deliverable"),
     tool("guard.check", "对交付物跑双层拦截网：确定性校验 + 语义合规校验",
          {"kind": STR, "content": STR, "order_id": ORDER, "geo": {"type": "boolean"}},
          ["kind", "content"], "guard"),

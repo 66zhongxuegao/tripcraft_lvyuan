@@ -334,19 +334,26 @@ function toggleMic() {
 async function hangup() {
   if (mode.value === 'voice' && ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: 'stop' }))
-  } else if (sessionId) {
-    try { await client.post(`/practice/call/${sessionId}/end`) } catch { /* ignore */ }
+    await new Promise((resolve) => window.setTimeout(resolve, 450))
   }
-  back()
+  if (sessionId) {
+    try { await client.post('/practice/call/' + sessionId + '/end') } catch { /* ignore */ }
+  }
+  cleanupCall()
+  router.push({ path: '/practice/im', query: { order: orderId.value } })
 }
 
-function back() {
+function cleanupCall() {
   try { ws?.close() } catch { /* ignore */ }
   proc?.disconnect()
   micStream?.getTracks().forEach((t) => t.stop())
   capCtx?.close()
   playCtx?.close()
   if (timerId) clearInterval(timerId)
+}
+
+function back() {
+  cleanupCall()
   router.back()
 }
 

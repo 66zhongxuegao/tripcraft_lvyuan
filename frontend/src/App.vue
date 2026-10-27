@@ -1,5 +1,6 @@
 <template>
-  <div class="app-shell">
+  <router-view v-if="standalone" />
+  <div v-else class="app-shell">
     <aside v-if="!isFullscreen" class="sidebar">
       <div class="side-top">
         <AppLogo />
@@ -17,40 +18,19 @@
       <div class="side-foot">
         <router-link to="/" class="foot-card" :class="{ on: route.path === '/' }">
           <span class="foot-title"><SIcon name="home" :size="15" /> 返回首页</span>
-          <span class="foot-sub">8 维 · 61 技能点<br />每分带证据</span>
         </router-link>
       </div>
     </aside>
 
     <main class="main">
-      <header class="topbar" :class="{ plain: isFullscreen }">
+      <header v-if="showTopbar" class="topbar" :class="{ plain: isFullscreen }">
         <div v-if="!isFullscreen" class="topbar-left">
           <h1 class="page-title">{{ pageHeading }}</h1>
         </div>
         <div class="topbar-right">
-          <span class="status" :class="online ? 'on' : 'off'"><i class="dot" />{{ online ? '已连接' : '未连接' }}</span>
-          <div class="account" @click="userMenuOpen = !userMenuOpen">
-            <span class="acc-avatar">{{ currentUserName.slice(0, 1) }}</span>
-            <span class="acc-name">{{ currentUserName }}</span>
-            <span class="acc-chev" />
-            <transition name="menu">
-              <div v-if="userMenuOpen" class="acc-menu" @click.stop>
-                <div class="acc-menu-hd">切换用户</div>
-                <div class="acc-item demo" @click="onDemo">
-                  <span class="demo-ic"><SIcon name="play" :size="12" /></span>
-                  <span class="demo-nm">演示账户</span>
-                  <i class="ai-on">全流程演示</i>
-                </div>
-                <div class="acc-divider" />
-                <div v-for="u in user.users" :key="u.id" class="acc-item"
-                  :class="{ on: u.id === user.userId }" @click="onSwitchTo(u.id)">
-                  <span class="ai-avatar">{{ u.name.slice(0, 1) }}</span>{{ u.name }}<i v-if="u.id === user.userId" class="ai-on">当前</i>
-                </div>
-                <div class="acc-divider" />
-                <div class="acc-item new" @click="onNewUser">＋ 新建用户</div>
-              </div>
-            </transition>
-          </div>
+          <span v-if="route.path !== '/'" class="status" :class="online ? 'on' : 'off'"><i class="dot" />{{ online ? '已连接' : '未连接' }}</span>
+          <!-- 学情画像与个人资料都在右上角用户菜单里（R12：从侧边栏移入这里） -->
+          <UserMenu v-if="showUserMenu" />
         </div>
       </header>
 
@@ -61,12 +41,8 @@
           </transition>
         </router-view>
       </section>
-      <ProgressDock v-if="route.path.startsWith('/practice')" :order-id="String(route.params.id || '')" />
+      <ProgressDock v-if="route.path.startsWith('/practice') && route.path !== '/practice'" :order-id="String(route.params.id || '')" />
     </main>
-
-    <div v-if="demo.active" class="demo-shield" />
-    <DemoCursor v-if="demo.active" />
-    <DemoBar v-if="demo.active" />
   </div>
 </template>
 
@@ -75,16 +51,25 @@ import { computed, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import AppLogo from '@/components/AppLogo.vue'
 import SIcon from '@/components/SIcon.vue'
-import DemoCursor from '@/demo/DemoCursor.vue'
-import DemoBar from '@/demo/DemoBar.vue'
+import UserMenu from '@/components/UserMenu.vue'
 import ProgressDock from '@/components/ProgressDock.vue'
 import client from '@/api/client'
 import { useUserStore } from '@/stores/user'
-import { useDemoStore } from '@/demo/store'
+
+/**
+ * 应用外壳：侧边栏 + 顶栏 + 用户菜单 + 内容区。
+ *
+ * 身份相关只做两件事：把右上角菜单挂上（UserMenu 自带个人资料 / 学情画像 / 退出），
+ * 登录页与注册页走 fullscreen 路由（不挂侧边栏）。会话恢复与未登录拦截由
+ * router/index.ts 的全局守卫 + stores/user.ts 负责，外壳不重复实现。
+ *
+ * 旧版「演示账户自动播放」（demo/DemoCursor、DemoBar、demo/store、axios 拦截伪造响应）
+ * 已整体删除。标准案例不再是公开入口：**演示实例由工作人员用内部启动方式开启**，
+ * 服务端把随机游客替换成固定案例，界面走同一套正常流程；内部排查页 /demo 只在演示实例可见。
+ */
 
 const route = useRoute()
-const user = useUserStore()
-const demo = useDemoStore()
+const userStore = useUserStore()
 const online = ref(false)
 
 const groups = [
@@ -97,18 +82,11 @@ const groups = [
     { path: '/practice/im', title: '聊天界面', icon: 'chat' },
   ]},
   { title: '训练反馈', items: [
-    { path: '/profile', title: '学情画像', icon: 'chart' },
-    { path: '/score', title: '评分复盘', icon: 'link' },
+    // R12：学情画像与个人资料**只在右上角用户菜单**（UserMenu）里进入。
+    // 这里不再保留「学情画像」入口，避免与右上角菜单形成两个入口。
     { path: '/toolbox', title: '工具台', icon: 'map' },
-    { path: '/system', title: '系统状态', icon: 'target' },
   ]},
 ]
-
-const userMenuOpen = ref(false)
-const currentUserName = computed(() => (demo.active ? '演示账户' : (user.users.find((u) => u.id === user.userId)?.name || user.userId)))
-function onSwitchTo(id: string) { if (id && id !== user.userId) { user.switchUser(id); window.location.reload() } }
-function onNewUser() { user.addUser(); window.location.reload() }
-function onDemo() { userMenuOpen.value = false; demo.start(); window.location.reload() }
 
 function isActive(p: string) {
   if (p === '/') return route.path === '/'
@@ -116,35 +94,44 @@ function isActive(p: string) {
   return route.path.startsWith(p)
 }
 
-/* 主标题直接承载页面用途，不再挂灰色副标题；补充说明放到正文层。 */
+/*
+ * 主标题只承载「这是什么页面」，不写实现语言、不堆装饰分隔符（R17）。
+ * 六阶段口径见 contracts/stages.py；这里不再出现「13 步」这类内部编号。
+ * 已删除 /learn/tutor、/learn/practice 两条：路由表里并不存在这两个路径（死键）。
+ */
 const HEADINGS: Record<string, string> = {
-  '/': '总览 · 定制师全流程实战',
-  '/learn': '学习地图 · 8 维 61 技能点',
-  '/learn/tutor': '技能点对话 · 生成学习资源',
-  '/learn/practice': '技能点练题 · 写回掌握度',
-  '/practice': '订单管理 · 逐单推进 13 步',
-  '/practice/messages': '消息中心 · 抢派单',
+  '/': '定制师全流程实战',
+  '/login': '登录',
+  '/register': '注册',
+  '/demo': '标准案例演示',
+  '/learn': '学习地图',
+  '/practice': '订单管理',
+  '/practice/messages': '消息中心',
   '/practice/orders': '订单详情',
-  '/practice/im': '聊天界面 · 客户 / 地接 / 供应商',
-  '/profile': '学情画像 · 掌握度与薄弱点',
-  '/score': '评分复盘 · 按订单下钻',
-  '/toolbox': '工具台 · 方案要用的外部数据',
-  '/system': '系统状态 · 导演规则与评分公信力',
+  '/practice/im': '聊天界面',
+  '/profile': '学情画像',
+  '/toolbox': '工具台',
+  '/dashboard': '训练数据看板',
 }
 const pageHeading = computed(() => HEADINGS[route.path] || String(route.meta.title || '总览'))
-/* 总览页走全画面：不挂侧边栏 */
+/* 全画面路由（总览 / 登录 / 注册）：不挂侧边栏 */
 const isFullscreen = computed(() => !!route.meta.fullscreen)
+/* 独立控制台（数据看板）：不挂侧边栏、顶栏与用户菜单 */
+const standalone = computed(() => !!route.meta.standalone)
+/* 登录页与注册页还没登录，不显示用户菜单 */
+const showUserMenu = computed(() => userStore.isAuthenticated)
+const showTopbar = computed(() => !isFullscreen.value || userStore.isAuthenticated)
 
 onMounted(async () => {
   try { online.value = (await client.get('/')).data?.status === 'ok' } catch { online.value = false }
-  demo.boot()
 })
 </script>
 
 <style scoped lang="scss">
 @use '@/styles/tokens.scss' as *;
 /* 底纹位移走 GPU 合成：曾直接动画 background-position，导致整屏逐帧重绘。 */
-.app-shell { position: relative; display: flex; height: 100vh; overflow: hidden; background: $color-bg; }
+/* 只让内容区滚动，避免长表单聚焦时把侧栏和顶栏一起卷走。 */
+.app-shell { position: relative; display: flex; height: 100vh; overflow: clip; background: $color-bg; }
 .app-shell::before {
   content: ''; position: absolute; inset: -25%; z-index: 0; pointer-events: none;
   background:
@@ -173,49 +160,55 @@ onMounted(async () => {
 .foot-card:hover { transform: translateY(-2px); box-shadow: 0 12px 24px rgba(37,119,227,0.32); }
 .foot-card.on { box-shadow: 0 0 0 3px rgba(37,119,227,0.18), 0 6px 16px rgba(37,119,227,0.24); }
 .foot-title { display: inline-flex; align-items: center; gap: 7px; font-size: 16px; font-weight: 700; }
-.foot-sub { display: block; margin-top: 5px; font-size: 14.5px; font-weight: 500; line-height: 1.5; color: rgba(255,255,255,0.9); }
 
 .main { position: relative; z-index: 1; flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .topbar { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 18px 28px; background: $color-surface; border-bottom: 1px solid $color-border; }
-/* 全画面路由（总览）：不写大标题，顶栏也退成一层薄边，让画面从顶部就开始 */
-/* 全画面路由：标题隐藏后只剩右侧一组，必须显式靠右，否则 space-between 会把它甩到最左 */
+/* 全画面路由（总览 / 登录 / 注册）：不写大标题，顶栏退成一层薄边 */
 .topbar.plain { padding: 12px 28px; background: transparent; border-bottom: none; justify-content: flex-end; }
 .content.plain { padding: 12px 28px 28px; }
 .page-title { font-size: $fs-page-title; font-weight: 800; letter-spacing: .3px; line-height: 1.25; }
 
 .topbar-right { display: flex; align-items: center; gap: 12px; }
-.account { position: relative; display: flex; align-items: center; gap: 8px; padding: 4px 12px 4px 5px; border: 1px solid $color-border; border-radius: 999px; background: #fff; cursor: pointer; transition: border-color .15s ease, box-shadow .15s ease; }
-.account:hover { border-color: $color-primary; box-shadow: $shadow-card; }
-.acc-avatar { width: 36px; height: 36px; border-radius: 50%; background: linear-gradient(135deg, #2577e3, #4a8ff0); color: #fff; display: flex; align-items: center; justify-content: center; font-size: 15.5px; font-weight: 700; }
-.acc-name { font-size: 15.5px; font-weight: 600; color: $color-text; }
-.acc-chev { width: 7px; height: 7px; border-right: 1.5px solid $color-text-secondary; border-bottom: 1.5px solid $color-text-secondary; transform: rotate(45deg) translateY(-2px); }
-.acc-menu { position: absolute; top: calc(100% + 8px); right: 0; width: 258px; background: #fff; border: 1px solid $color-border; border-radius: 12px; box-shadow: 0 16px 40px rgba(16,32,56,0.18); padding: 7px; z-index: 50; }
-.acc-menu-hd { font-size: 14.5px; color: $color-text-muted; padding: 5px 9px; letter-spacing: 1px; }
-.acc-item { display: flex; align-items: center; gap: 10px; padding: 10px; border-radius: 8px; font-size: 15.5px; color: $color-text; cursor: pointer; }
-.acc-item:hover { background: $color-primary-softer; }
-.acc-item.on { background: $color-primary-soft; color: $color-primary; font-weight: 600; }
-.ai-avatar { width: 26px; height: 26px; border-radius: 50%; background: $color-primary-soft; color: $color-primary; display: flex; align-items: center; justify-content: center; font-size: 14px; font-weight: 700; flex-shrink: 0; }
-.ai-on { margin-left: auto; font-style: normal; font-size: 13.5px; color: $color-primary; background: $color-primary-soft; border-radius: 999px; padding: 1px 7px; }
-/* 演示期间屏蔽真实鼠标：页面只能看，不能点 */
-.demo-shield { position: fixed; inset: 0; z-index: 2147482990; background: transparent; }
-
-.acc-item.new { color: $color-primary; font-weight: 600; }
-.acc-item.demo { background: $color-primary-softer; }
-.acc-item.demo:hover { background: $color-primary-soft; }
-.demo-ic { width: 26px; height: 26px; border-radius: 50%; background: $color-primary; color: #fff; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
-.demo-nm { font-weight: 700; color: $color-primary; }
-.acc-divider { height: 1px; background: $color-border; margin: 5px 4px; }
-.menu-enter-active, .menu-leave-active { transition: opacity .16s ease, transform .16s ease; }
-.menu-enter-from, .menu-leave-to { opacity: 0; transform: translateY(-6px); }
 .status { display: inline-flex; align-items: center; gap: 7px; font-size: 14.5px; padding: 6px 14px; border-radius: 999px; background: $color-bg; border: 1px solid $color-border; }
 .status .dot { width: 8px; height: 8px; border-radius: 50%; }
 .status.on { color: $color-success; } .status.on .dot { background: $color-success; }
 .status.off { color: $color-danger; } .status.off .dot { background: $color-danger; }
 
 .content { flex: 1; overflow-y: auto; padding: 20px 28px 40px; }
-.step-wrap { margin-bottom: 14px; }
 .fade-enter-active, .fade-leave-active { transition: opacity .16s ease, transform .16s ease; }
 .fade-enter-from { opacity: 0; transform: translateY(5px); }
 .fade-leave-to { opacity: 0; }
 
+/* 窄屏（App-like）：侧边栏收起为横向可滚动的导航条，表单与内容保持可读可点 */
+@media (max-width: 900px) {
+  /*
+   * 横向溢出修复（Codex 实测 390px 视口 scrollWidth=488）：
+   * 此前桌面态 .app-shell 用 overflow:hidden，窄屏为了允许纵向翻页改成了 overflow:visible，
+   * 于是装饰层 .app-shell::before 的 inset:-25% 直接把文档撑宽 25%×2 → 488/390 ≈ 1.25，正好对上。
+   * 现在：横向用 clip（不产生滚动容器，也不裁掉纵向可见性），并关掉这层装饰底纹。
+   */
+  .app-shell { flex-direction: column; height: auto; min-height: 100vh; overflow-x: clip; overflow-y: visible; }
+  .app-shell::before { display: none; }
+  .sidebar { width: 100%; max-width: 100%; border-right: none; border-bottom: 1px solid $color-border; }
+  .side-top { padding: 12px 16px 10px; }
+  .side-nav { flex-direction: row; overflow-x: auto; overflow-y: hidden; gap: 6px; padding: 8px 12px; }
+  .nav-group { display: none; }
+  .nav-item { white-space: nowrap; padding: 8px 12px; font-size: 14.5px; }
+  .nav-item::before { display: none; }
+  .side-foot { display: none; }
+  .main { overflow: visible; min-width: 0; max-width: 100%; }
+  .topbar { padding: 12px 16px; flex-wrap: wrap; gap: 10px; }
+  .topbar.plain { padding: 10px 16px; }
+  /* 顶栏右侧（连接状态 + 用户菜单）在窄屏允许换行，不把标题挤出视口 */
+  .topbar-right { flex-wrap: wrap; gap: 8px; row-gap: 8px; min-width: 0; }
+  .content { padding: 14px 16px 32px; }
+  .page-title { font-size: 18px; overflow-wrap: anywhere; }
+}
+
+/* 更窄（≤400px，含 390px 视口）：状态徽标只留圆点与短文案，保证顶栏不横向撑开 */
+@media (max-width: 400px) {
+  .topbar { padding: 10px 12px; }
+  .status { padding: 5px 9px; font-size: 13px; }
+  .content { padding: 12px 12px 28px; }
+}
 </style>

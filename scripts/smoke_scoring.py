@@ -1,7 +1,7 @@
 """实战评分链路冒烟：通话/交付物 -> 证据 -> 评分 Agent -> 画像写回。
 
 用法：python -X utf8 scripts/smoke_scoring.py [order_id]
-前置：后端已启动（127.0.0.1:18010）。
+前置：后端已启动（127.0.0.1:18020）。
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ import json
 import sys
 import urllib.request
 
-BASE = "http://127.0.0.1:18010"
+BASE = "http://127.0.0.1:18020"
 
 
 def call(method: str, path: str, body: dict | None = None, timeout: float = 180.0):

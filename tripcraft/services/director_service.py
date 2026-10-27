@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import time
+from .competition_mode import enabled as competition_easy
 from typing import Any
 
 from .finance_service import FinanceService
@@ -35,6 +36,7 @@ ACTION_TO_EVENT: dict[str, str] = {
     "resources_locked": "resource_locked",
     "pre_trip_notice": "pre_trip",
     "deliverable:出团通知书": "pre_trip",
+    "depart": "depart",
     "settlement_verified": "settlement_submitted",
     "balance_paid": "balance_paid",
     "review_done": "review_done",
@@ -43,7 +45,7 @@ ACTION_TO_EVENT: dict[str, str] = {
 
 EVENTS = ("grab", "call_done", "requirement_confirmed", "plan_sent", "quote_sent",
           "customer_confirmed", "contract_signed", "contract_confirmed", "deposit_paid",
-          "resource_locked", "pre_trip", "settlement_submitted", "balance_paid", "review_done")
+          "resource_locked", "pre_trip", "depart", "settlement_submitted", "balance_paid", "review_done")
 
 # 注入强度
 EXPLICIT, NORMAL, IMPLICIT = "explicit", "normal", "implicit"
@@ -152,7 +154,7 @@ INCIDENT_RULES: tuple[dict[str, Any], ...] = (
                          "note": "已锁的四星酒店超售；同档次替代酒店离景区 20 分钟车程，贵 60 元/间/晚"}),
          cost={"code": "COST-HOTEL-OVERBOOK", "label": "替代酒店差价", "kind": "酒店",
                "amount_per": 60, "unit": "间晚"}),
-    rule("INC-VEHICLE-BREAKDOWN", "S10", ("depart", "pre_trip"), "司导沟通群", "司机·赵师傅",
+    rule("INC-VEHICLE-BREAKDOWN", "S10", ("depart",), "司导沟通群", "司机·赵师傅",
          "车辆故障",
          "车出问题了，早上怕是赶不上 8 点出发，我正在联系换车。客人那边您先帮我安抚一下，最快 7 点前给你们准信。",
          ("C6.1", "C6.2", "C6.3", "C6.5", "C6.7"), stage_min=4,
@@ -196,8 +198,12 @@ class DirectorService:
     TEACH_UNLOCK = 60      # 教学掌握度到 60 才算「学过」，学过才解锁对应事件
 
     def _abilities(self, order_row: dict) -> dict:
+        """按订单归属取学员能力；**不**在缺归属时退化成 demo 用户（否则 A 单会读 B 的画像）。"""
+        user_id = (order_row.get("user_id") or "").strip()
+        if not user_id:
+            return {}
         try:
-            return self._store.abilities(order_row.get("user_id") or "u-demo")
+            return self._store.abilities(user_id)
         except Exception:
             return {}
 
@@ -261,6 +267,34 @@ class DirectorService:
             return IMPLICIT
         return NORMAL
 
+    def materialize_resource_pool(self, order_id: str, text: str, kinds: list[str],
+                                  city: str, date: str = "") -> dict:
+        """地接回答后，把本单本城需要的资源加入可添加联系人池。
+
+        只写订单事实与资源池，不直接替学员添加联系人。允许资源：
+        酒店、车队、导游、司机、门票。门票不进联系人目录，由地接报价。
+        """
+        allowed = {"酒店", "车队", "导游", "司机", "门票"}
+        kinds = [kind for kind in dict.fromkeys(kinds or []) if kind in allowed]
+        row = self._store.order(order_id)
+        if not row or not city:
+            return {}
+        try:
+            payload = json.loads(row.get("payload") or "{}")
+        except (TypeError, ValueError):
+            payload = {}
+        old = payload.get("resource_pool") or {}
+        merged = set(kinds)
+        if old.get("city") == city:
+            merged |= {kind for kind in old.get("kinds") or [] if kind in allowed}
+        pool = {"city": city, "kinds": sorted(merged), "date": date or old.get("date") or "",
+                "inquiry": str(text or "")[:800], "at": time.strftime("%Y-%m-%d %H:%M:%S")}
+        payload["resource_pool"] = pool
+        self._store._exec("UPDATE biz_order SET payload=? WHERE order_id=?",
+                          (json.dumps(payload, ensure_ascii=False), order_id))
+        self._store.add_event(order_id, "resource_pool_updated", pool)
+        return pool
+
     # ---------- 学员动作 → 自动注入 ----------
 
     def on_action(self, order_id: str, action: str) -> dict | None:
@@ -305,7 +339,7 @@ class DirectorService:
             kind, patch = r["effect"]
             SupplierService(self._store).apply_fact(order_id, kind, patch)
 
-        session_id = self._ensure_channel(row, r["channel"])
+        session_id = self._ensure_channel(row, r["channel"], r["speaker"])
         speaker = self._speaker_name(row, r["speaker"])
         # 只把「已经学过（教学掌握度 ≥ 60）」的点纳入这起事件的考核范围：
         # 规则里还没教过的点不进分母——和 unlocked 同一口径，不用没教过的东西扣分。
@@ -323,6 +357,8 @@ class DirectorService:
         if self._practice is not None:
             for sp in tested:
                 self._practice.mark_trigger(order_id, sp, r["step"])
+                if competition_easy():
+                    self._practice.mark_reacted(order_id, sp)
         return {"incident_id": incident_id, "code": r["code"], "title": r["title"],
                 "step": r["step"], "channel": r["channel"], "speaker": r["speaker"],
                 "body": body, "skill_points": list(tested),
@@ -340,7 +376,7 @@ class DirectorService:
         return {"event": type_, "injected": self._decide(order_id, row, type_)}
 
     def _speaker_name(self, order: dict, speaker: str) -> str:
-        """规则里的占位发言人换成这一单的真实联系人名（客户/导游/司机）。"""
+        """规则里的占位发言人换成这一单的真实联系人名。"""
         try:
             names = SupplierService(self._store).names(order["order_id"])
         except Exception:
@@ -350,16 +386,31 @@ class DirectorService:
                 return names.get(kind) or speaker
         if speaker.startswith("客户"):
             return order.get("customer") or speaker
+        if speaker.startswith("XX地接") or speaker.startswith("地接"):
+            return names.get("地接社") or speaker
+        if speaker.startswith("酒店"):
+            return names.get("酒店") or speaker
+        if speaker.startswith("车队"):
+            return names.get("车队") or speaker
+        if speaker.startswith("票务"):
+            return names.get("票务") or speaker
         return speaker
 
-    def _ensure_channel(self, order: dict, name: str) -> str:
-        """事件落到**实际存在的会话**：对应联系人的单聊；资源类没有单聊就落到资源大群。"""
+    def _ensure_channel(self, order: dict, name: str, speaker: str = "") -> str:
+        """事件落到实际存在的会话：司导事件优先按发言角色，缺失时落到已有导游单聊。"""
         svc = SupplierService(self._store)
-        g = svc.group_by_name(order["order_id"], name)
+        order_id = order["order_id"]
+        if name == "司导沟通群":
+            kind = "司机" if speaker.startswith("司机") else "导游"
+            sid = svc.contact_dm(order["user_id"], kind, order_id)
+            if not sid and kind == "司机":
+                sid = svc.contact_dm(order["user_id"], "导游", order_id)
+            if sid:
+                return sid
+        g = svc.group_by_name(order_id, name)
         if g:
             return g["session_id"]
-        return svc.ensure_hub(order["user_id"])["session_id"]
-
+        return svc.ensure_hub(order["user_id"], order_id)["session_id"]
     # ---------- 学员反应 ----------
 
     def react(self, session_id: str) -> list[str]:
@@ -374,7 +425,35 @@ class DirectorService:
                     continue
                 self._practice.mark_reacted(inc["order_id"], sp)
                 marked.append(sp)
+            if inc.get("code") == "INC-VEHICLE-BREAKDOWN":
+                self._vehicle_followup(inc)
         return marked
+
+    def _vehicle_followup(self, inc: dict) -> None:
+        """学员第一次回应车辆故障后，给一次确定结果，避免“7 点准信”永远悬着。"""
+        session_id = inc.get("session_id") or ""
+        if not session_id:
+            return
+        for msg in self._store.im_messages(session_id):
+            try:
+                payload = json.loads(msg.get("payload") or "{}")
+            except Exception:
+                payload = {}
+            if payload.get("incident_followup") == "INC-VEHICLE-BREAKDOWN":
+                return
+        speaker = inc.get("speaker") or "司机"
+        body = ("换到车了：替换车 7:20 到酒店，8 点出发来得及。"
+                "临时换车费 400 元由车队承担，麻烦你跟客人同步一下。")
+        self._store.add_im_message(
+            session_id, speaker, "other", body, kind="text",
+            payload={"incident_followup": "INC-VEHICLE-BREAKDOWN"})
+        try:
+            SupplierService(self._store).apply_fact(
+                inc["order_id"], "车队",
+                {"availability": "可用",
+                 "note": "替换车 7:20 到酒店；8 点出发；临时换车费 400 元由车队承担"})
+        except Exception:
+            pass
 
     # ---------- 时间线 / 规则表 ----------
 

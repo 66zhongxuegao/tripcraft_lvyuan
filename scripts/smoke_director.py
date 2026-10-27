@@ -4,7 +4,7 @@
       → 覆盖校验 → 评分 → 低置信度转人工。
 
 用法：python -X utf8 scripts/smoke_director.py [order_id]
-前置：后端已启动（127.0.0.1:18010）。
+前置：后端已启动（127.0.0.1:18020）。
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ import sys
 import urllib.parse
 import urllib.request
 
-BASE = "http://127.0.0.1:18010"
+BASE = "http://127.0.0.1:18020"
 
 
 def call(method: str, path: str, body: dict | None = None, timeout: float = 240.0):

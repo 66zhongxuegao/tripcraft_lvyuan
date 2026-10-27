@@ -213,16 +213,45 @@ def test_full_workflow_advances_to_done():
     assert svc.gate_report(oid)["total"] == 0, "订单完成后没有剩余门槛"
 
 
-def test_first_call_beyond_limit_blocks_advance():
+def test_late_first_call_keeps_timeout_but_allows_resource_inquiry():
+    from tripcraft.services.supplier_service import SupplierService
+
     svc, store = make()
     oid = "9000000000000006"
+    svc._set_payload(oid, grabbed_at="2026-10-08T09:00:00")
     for action, at in (("grab", "2026-10-08T09:00:00"), ("first_call", "2026-10-08T11:30:00")):
         store.add_action(oid, action)
         store._exec("UPDATE order_action SET at=? WHERE order_id=? AND action=?", (at, oid, action))
     g = svc.gate_report(oid)
     check = next(c for c in g["checks"] if c["action"] == "first_call")
-    assert check["ok"] is False and "\u8d85\u8fc7" in check["reason"]
+    assert check["ok"] is True and "超过" in check["reason"]
+    assert store.has_action(oid, "deadline_miss:first_call")
+    # 未产出需求确认单时仍然拦截；补齐后进入资源询价。
     assert svc.try_advance(oid)["advanced"] == []
+    out = svc.record_action(oid, "deliverable:需求确认单")
+    assert out["advance"]["advanced"] == [1]
+    from tripcraft.services.journey_service import journey
+    assert journey(store, oid)["current_stage"] == "pre2_plan"
+    suppliers = SupplierService(store=store, llm=None, practice=svc)
+    hub = suppliers.ensure_hub("u1")
+    reply = suppliers.respond(hub["session_id"], "请核一下住宿和用车报价", order_id=oid)
+    assert reply["deferred"] is False and reply["quote"]["kind"] == "地接社"
+    assert store.quote(oid, "地接社")
+    assert svc.dispatch_info(oid)["first_call"]["missed"] is True
+    svc.try_advance(oid)
+    assert len([e for e in store.events(oid) if e["type"] == "deadline_miss"]) == 1
+
+
+def test_first_call_uses_order_limit_for_timeout_warning():
+    svc, store = make()
+    oid = "9000000000000006"
+    svc._set_payload(oid, grabbed_at="2026-10-08T09:00:00", first_call_limit_min=120)
+    for action, at in (("grab", "2026-10-08T09:00:00"), ("first_call", "2026-10-08T10:30:00")):
+        store.add_action(oid, action)
+        store._exec("UPDATE order_action SET at=? WHERE order_id=? AND action=?", (at, oid, action))
+    check = next(c for c in svc.gate_report(oid)["checks"] if c["action"] == "first_call")
+    assert check["ok"] is True and check["reason"] == ""
+    assert not store.has_action(oid, "deadline_miss:first_call")
 
 
 def test_seeded_orders_have_backfilled_actions():

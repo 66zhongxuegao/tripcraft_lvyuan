@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+from .competition_mode import enabled as competition_easy
 import json
 from datetime import datetime, timedelta
 
@@ -105,13 +106,19 @@ class PlanService:
         if out.get("blocked"):
             return {"ok": False, "blocked": True, "guard": out.get("guard"),
                     "plan": self._view(raw)}
-        due = _now() + timedelta(seconds=READ_AFTER_SECONDS)
+        due = _now() if competition_easy() else _now() + timedelta(seconds=READ_AFTER_SECONDS)
         self._store.update_plan(plan_id, status="已发送", sent_at=_fmt(_now()),
                                 read_due_at=_fmt(due),
                                 channels=json.dumps(targets or [], ensure_ascii=False))
-        plan = self._view(self._store.plan(plan_id))
+        plan = (self._materialize_read(self._store.plan(plan_id)) if competition_easy()
+                else self._view(self._store.plan(plan_id)))
         plan["routing"] = out.get("routing")
         plan["deliverable_version"] = out.get("version")
+        if competition_easy() and self._practice is not None and int(
+                (self._store.order(order_id) or {}).get("stage_index") or 0) == 1:
+            # 客户已满意读完方案，登记确认动作；仍按阶段顺序只推进一阶。
+            self._practice.record_action(order_id, "customer_confirmed_plan",
+                                         {"plan_id": plan_id, "from": "competition_satisfied"})
         return {"ok": True, "blocked": False, "plan": plan}
 
     # ---------- 客户已读（到点由客户 Agent 真的读一遍） ----------
@@ -132,14 +139,15 @@ class PlanService:
         if self._tools is not None:
             try:
                 fb = self._tools.deliverable_feedback(
-                    "行程方案", rendered, self._store.order(row["order_id"])["customer"])
+                    "行程方案", rendered, self._store.order(row["order_id"])["customer"], order_id=row["order_id"], channel="plan")
                 reply = fb.get("reply", "")
                 sentiment = fb.get("sentiment", "")
                 asks = fb.get("asks", []) or []
             except Exception:
                 reply = ""
         if not reply:
-            reply = "方案我看过了，整体没问题，我再想想细节。"
+            from .customer_context import fallback_reply
+            reply = fallback_reply(self._store.ensure_customer_card(row["order_id"]), feedback=True)
         self._store.update_plan(row["plan_id"], status="已读", read_at=_fmt(_now()),
                                 feedback=reply)
         sess = self._customer_session(row["order_id"])
@@ -158,7 +166,12 @@ class PlanService:
         return view
 
     def _render(self, values: dict, row: dict) -> str:
-        from ..contracts.deliverables_spec import render, resolve
+        """客户 Agent 读到的方案文本：必须是**客户输出**（脱敏版）。
+
+        方案内容里如果混进了成本/毛利口径，客户这一侧不能看到；内部档案与评分走
+        交付物链路的内部渲染（deliverable_service），与这里无关。
+        """
+        from ..contracts.deliverables_spec import render_for_customer, resolve
         spec = resolve("行程方案")
         order = self._store.order(row["order_id"]) or {}
         payload = json.loads(order.get("payload") or "{}")
@@ -166,7 +179,7 @@ class PlanService:
                "destination": order.get("destination", ""),
                "source_market": payload.get("source_market", ""),
                "language": payload.get("language", "中文")}
-        return render(spec, values, ctx)
+        return render_for_customer(spec, values, ctx)[0]
 
     def _customer_session(self, order_id: str) -> str:
         from .supplier_service import SupplierService
@@ -180,7 +193,7 @@ class PlanService:
 
     def confirm(self, order_id: str, plan_id: str) -> dict:
         row = self._row(order_id, plan_id)
-        if not row.get("read_at"):
+        if not row.get("read_at") and not competition_easy():
             return {"ok": False, "error": "客户还没读过方案，先发送并等客户已读", "plan": row}
         self._store.update_plan(plan_id, status="客户已确认", confirm_at=_fmt(_now()))
         if self._practice is not None:

@@ -1,142 +1,249 @@
 <template>
-  <div class="map-wrap" ref="wrapRef" :class="{ dragging }" @mousedown="onDown">
-    <div class="stage" :style="stageStyle" @click.self="tapCollapse">
-      <div class="orbit orbit-a" />
-      <div class="orbit orbit-b" />
+  <div class="learn-page">
+    <header class="learn-head">
+      <div class="lh-copy">
+        <span class="lh-kicker">LEARNING ATLAS</span>
+        <h2>学习地图</h2>
+        <p v-if="treeMode">技能树看全局结构，路线模式按你的画像和需求决定先学什么。</p>
+      </div>
+      <div class="mode-switch" role="group" aria-label="学习地图显示模式">
+        <button type="button" :class="{ on: mode === 'tree' }" data-role="mode-tree" @click="setMode('tree')">
+          <SIcon name="layers" :size="15" /> 技能树模式
+        </button>
+        <button type="button" :class="{ on: mode === 'route' }" data-role="mode-route" @click="setMode('route')">
+          <SIcon name="route" :size="15" /> 路线模式
+        </button>
+      </div>
+    </header>
 
-      <svg class="links" :width="SIZE" :height="SIZE">
-        <template v-if="!focused">
-          <line v-for="d in dims" :key="'l-' + d.id" :x1="CX" :y1="CY"
-            :x2="d.x" :y2="d.y" :stroke="d.color + '3d'" stroke-width="1.5" />
-        </template>
-        <template v-else>
-          <line v-for="p in spNodes" :key="'sl-' + p.id" :x1="CX" :y1="CY"
-            :x2="p.x" :y2="p.y" :stroke="focused.color + '52'" stroke-width="1.5" />
-        </template>
-      </svg>
-
-      <!-- 中心总览（展开后隐藏） -->
-      <div v-if="!focused" class="node center" :style="{ left: CX + 'px', top: CY + 'px' }" @click.stop="collapse">
-        <div class="disc" />
-        <svg class="rings" viewBox="0 0 100 100">
-          <circle cx="50" cy="50" r="46" fill="none" stroke="#d3dce9" stroke-width="4" />
-          <circle cx="50" cy="50" r="46" fill="none" stroke="#2577e3" stroke-width="4" stroke-linecap="round"
-            :stroke-dasharray="C43" :stroke-dashoffset="off(46, overall.teach)" transform="rotate(-90 50 50)" />
-          <circle cx="50" cy="50" r="37" fill="none" stroke="#d3dce9" stroke-width="3.5" />
-          <circle cx="50" cy="50" r="37" fill="none" stroke="#e08a1e" stroke-width="3.5" stroke-linecap="round"
-            :stroke-dasharray="C30" :stroke-dashoffset="off(37, overall.real)" transform="rotate(-90 50 50)" />
-        </svg>
-        <div class="txt center-txt">
-          <div class="t-name">总掌握度</div>
-          <div class="t-vals"><span class="tv teach">{{ overall.teach }}</span><span class="tv real">{{ overall.real }}</span></div>
+    <section v-if="mode === 'route'" class="route-shell">
+      <div v-if="routeLoading" class="route-state"><i class="loading-ring" />正在读取路线…</div>
+      <div v-else-if="routeError" class="route-state error">
+        {{ routeError }} <button class="mini" @click="loadRoute">重试</button>
+      </div>
+      <div v-else-if="!route" class="route-empty">
+        <div class="re-icon"><SIcon name="compass" :size="22" /></div>
+        <h3>路线还没有生成</h3>
+        <p>可以不填需求，直接让管家按画像短板排；也可以说说这次最想补什么。</p>
+        <textarea v-model="routeDemand" rows="2" placeholder="例如：下个月接亲子团，重点补报价、节奏和突发处理" />
+        <div class="re-actions">
+          <button class="tc-btn primary" :disabled="routeBusy" @click="generateRoute()">
+            <SIcon name="sparkle" :size="14" /> {{ routeBusy ? '正在排路线…' : '直接生成推荐路线' }}
+          </button>
+          <button class="tc-btn ghost" @click="setMode('tree')">先看技能树</button>
         </div>
       </div>
 
-      <!-- 第二层：维度（聚焦时其余隐藏；当前维度移动到中心） -->
-      <div v-for="(d, i) in dims" :key="d.id" class="node dim"
-        :class="{ on: focusedId === d.id, gone: focused && focusedId !== d.id }"
-        :style="{ left: dimPos(d).x + 'px', top: dimPos(d).y + 'px', '--dim': d.color, animationDelay: (0.06 * (i + 1)) + 's' }"
-        @click.stop="focusDim(d.id)">
-        <div class="disc" />
-        <svg class="rings" viewBox="0 0 100 100">
-          <circle cx="50" cy="50" r="46" fill="none" stroke="#d3dce9" stroke-width="4" />
-          <circle cx="50" cy="50" r="46" fill="none" stroke="#2577e3" stroke-width="4" stroke-linecap="round"
-            :stroke-dasharray="C43" :stroke-dashoffset="off(46, d.teach)" transform="rotate(-90 50 50)" />
-          <circle cx="50" cy="50" r="37" fill="none" stroke="#d3dce9" stroke-width="3.5" />
-          <circle cx="50" cy="50" r="37" fill="none" stroke="#e08a1e" stroke-width="3.5" stroke-linecap="round"
-            :stroke-dasharray="C30" :stroke-dashoffset="off(37, d.real)" transform="rotate(-90 50 50)" />
-        </svg>
-        <div class="txt dim-txt">
-          <div class="t-name">{{ d.short }}</div>
-          <div class="t-vals"><span class="tv teach">{{ d.teach }}</span><span class="tv real">{{ d.real }}</span></div>
-        </div>
-      </div>
+      <template v-else>
+        <article class="priority-hero">
+          <div class="ph-actions">
+            <button class="tc-btn ghost" data-role="route-adjust" @click="adjustOpen = true">
+              <SIcon name="chat" :size="14" /> 调整路线
+            </button>
+            <button class="tc-btn ghost" :disabled="routeBusy" @click="generateRoute(true)">重新生成</button>
+          </div>
+          <div class="ph-number">01</div>
+          <div class="ph-copy">
+            <h1>
+              <span>系统建议你目前应当优先学习</span>
+              <strong>{{ priorityItem?.name }}</strong>
+            </h1>
+            <div v-if="priorityItem" class="ph-tags">
+              <span>{{ priorityItem.id }}</span>
+              <span>{{ priorityItem.dimension_name }}</span>
+              <span>{{ priorityItem.stage_name }}</span>
+            </div>
+          </div>
+          <div v-if="priorityItem" class="ph-score">
+            <b>{{ priorityItem.score.toFixed(0) }}</b>
+            <span>初始能力</span>
+          </div>
+          <button v-if="priorityItem" class="ph-start" @click="enter(priorityItem.id)">
+            开始学习这一项 <SIcon name="right" :size="15" />
+          </button>
+        </article>
 
-      <!-- 第三层：技能点（以中心为圆心的真实坐标铺开，宽扇面 + 交错半径） -->
-      <transition-group name="pop">
-        <div v-for="(s, i) in spNodes" :key="s.id" class="node sp"
-          :style="{ left: s.x + 'px', top: s.y + 'px', '--dim': focused ? focused.color : '#2577e3', animationDelay: (0.045 * i) + 's' }"
-          @click.stop="selectSp(s)">
+        <div class="route-stream">
+          <div class="stream-title">
+            <span>后续学习顺序</span>
+            <b>{{ route.items.length - 1 }} 项</b>
+          </div>
+          <div class="route-lane">
+            <section v-for="tier in remainingTiers" :key="tier.key" class="route-tier" :style="{ '--tier': tier.color }">
+              <header class="tier-head">
+                <i class="tier-dot" />
+                <h4>{{ tier.label }}</h4>
+                <span class="tier-count">{{ tier.items.length }}</span>
+              </header>
+              <div class="tier-items">
+                <article v-for="item in tier.items" :key="item.id" class="route-item"
+                  :style="{ '--delay': ((item.order - 2) * 0.035) + 's' }" @click="enter(item.id)">
+                  <span class="ri-order">{{ String(item.order).padStart(2, '0') }}</span>
+                  <div class="ri-main">
+                    <h5>{{ item.name }}</h5>
+                    <div class="ri-meta"><span class="ri-id">{{ item.id }}</span><span>{{ item.dimension_name }}</span></div>
+                  </div>
+                  <span class="ri-score">{{ item.score.toFixed(0) }}</span>
+                  <SIcon name="right" :size="14" class="ri-arrow" />
+                </article>
+              </div>
+            </section>
+          </div>
+        </div>
+
+        <div v-if="adjustOpen" class="route-dialog-mask" @click.self="adjustOpen = false">
+          <section class="route-dialog">
+            <header>
+              <div><span class="rd-kicker">路线管家</span><h3>和管家说说想怎么调整</h3></div>
+              <button class="close-btn" @click="adjustOpen = false"><SIcon name="x" :size="16" /></button>
+            </header>
+            <div class="rd-log">
+              <div v-for="(m, i) in route.messages || []" :key="i" class="rd-msg" :class="m.role">
+                <span>{{ m.role === 'user' ? '你' : '管家' }}</span><p>{{ m.text }}</p>
+              </div>
+            </div>
+            <textarea v-model="adjustText" rows="3" placeholder="例如：把跨文化沟通放到第一批，报价放后面；或者这周只有 3 小时" />
+            <div class="rd-actions">
+              <button class="tc-btn primary" data-role="route-revise" :disabled="routeBusy || !adjustText.trim()" @click="reviseRoute">
+                {{ routeBusy ? '正在调整…' : '让管家调整路线' }}
+              </button>
+            </div>
+          </section>
+        </div>
+      </template>
+    </section>
+
+    <div v-show="treeMode" class="map-wrap" ref="wrapRef" :class="{ dragging }" @mousedown="onDown">
+      <div class="stage" :style="stageStyle" @click.self="tapCollapse">
+        <div class="orbit orbit-a" />
+        <div class="orbit orbit-b" />
+        <svg class="links" :width="SIZE" :height="SIZE">
+          <template v-if="!focused">
+            <line v-for="d in dims" :key="'l-' + d.id" :x1="CX" :y1="CY"
+              :x2="d.x" :y2="d.y" :stroke="d.color + '3d'" stroke-width="1.5" />
+          </template>
+          <template v-else>
+            <line v-for="p in spNodes" :key="'sl-' + p.id" :x1="CX" :y1="CY"
+              :x2="p.x" :y2="p.y" :stroke="focused.color + '52'" stroke-width="1.5" />
+          </template>
+        </svg>
+
+        <div v-if="!focused" class="node center" :style="{ left: CX + 'px', top: CY + 'px' }" @click.stop="collapse">
           <div class="disc" />
           <svg class="rings" viewBox="0 0 100 100">
             <circle cx="50" cy="50" r="46" fill="none" stroke="#d3dce9" stroke-width="4" />
             <circle cx="50" cy="50" r="46" fill="none" stroke="#2577e3" stroke-width="4" stroke-linecap="round"
-              :stroke-dasharray="C43" :stroke-dashoffset="off(46, s.teach)" transform="rotate(-90 50 50)" />
+              :stroke-dasharray="C43" :stroke-dashoffset="off(46, overall.teach)" transform="rotate(-90 50 50)" />
             <circle cx="50" cy="50" r="37" fill="none" stroke="#d3dce9" stroke-width="3.5" />
             <circle cx="50" cy="50" r="37" fill="none" stroke="#e08a1e" stroke-width="3.5" stroke-linecap="round"
-              :stroke-dasharray="C30" :stroke-dashoffset="off(37, s.real)" transform="rotate(-90 50 50)" />
+              :stroke-dasharray="C30" :stroke-dashoffset="off(37, overall.real)" transform="rotate(-90 50 50)" />
           </svg>
-          <div class="txt sp-txt">
-            <div class="spn">{{ s.label }}</div>
-            <div class="spv"><span class="tv teach">{{ s.teach }}</span><span class="tv real">{{ s.real }}</span></div>
+          <div class="txt center-txt">
+            <div class="t-name">总掌握度</div>
+            <div class="t-vals"><span class="tv teach">{{ overall.teach }}</span><span class="tv real">{{ overall.real }}</span></div>
           </div>
         </div>
-      </transition-group>
 
-      <button class="reset-btn" @click.stop="resetView"><SIcon name="compass" :size="13" /> 复位</button>
+        <div v-for="(d, i) in dims" :key="d.id" class="node dim"
+          :class="{ on: focusedId === d.id, gone: focused && focusedId !== d.id }"
+          :style="{ left: dimPos(d).x + 'px', top: dimPos(d).y + 'px', '--dim': d.color, animationDelay: (0.06 * (i + 1)) + 's' }"
+          @click.stop="focusDim(d.id)">
+          <div class="disc" />
+          <svg class="rings" viewBox="0 0 100 100">
+            <circle cx="50" cy="50" r="46" fill="none" stroke="#d3dce9" stroke-width="4" />
+            <circle cx="50" cy="50" r="46" fill="none" stroke="#2577e3" stroke-width="4" stroke-linecap="round"
+              :stroke-dasharray="C43" :stroke-dashoffset="off(46, d.teach)" transform="rotate(-90 50 50)" />
+            <circle cx="50" cy="50" r="37" fill="none" stroke="#d3dce9" stroke-width="3.5" />
+            <circle cx="50" cy="50" r="37" fill="none" stroke="#e08a1e" stroke-width="3.5" stroke-linecap="round"
+              :stroke-dasharray="C30" :stroke-dashoffset="off(37, d.real)" transform="rotate(-90 50 50)" />
+          </svg>
+          <div class="txt dim-txt">
+            <div class="t-name">{{ d.short }}</div>
+            <div class="t-vals"><span class="tv teach">{{ d.teach }}</span><span class="tv real">{{ d.real }}</span></div>
+          </div>
+        </div>
 
-      <div class="legend">
-        <span class="lg"><i class="sw teach" />教学</span>
-        <span class="lg"><i class="sw real" />实战</span>
+        <transition-group name="pop">
+          <div v-for="(s, i) in spNodes" :key="s.id" class="node sp"
+            :style="{ left: s.x + 'px', top: s.y + 'px', '--dim': focused ? focused.color : '#2577e3', animationDelay: (0.045 * i) + 's' }"
+            @click.stop="selectSp(s)">
+            <div class="disc" />
+            <svg class="rings" viewBox="0 0 100 100">
+              <circle cx="50" cy="50" r="46" fill="none" stroke="#d3dce9" stroke-width="4" />
+              <circle cx="50" cy="50" r="46" fill="none" stroke="#2577e3" stroke-width="4" stroke-linecap="round"
+                :stroke-dasharray="C43" :stroke-dashoffset="off(46, s.teach)" transform="rotate(-90 50 50)" />
+              <circle cx="50" cy="50" r="37" fill="none" stroke="#d3dce9" stroke-width="3.5" />
+              <circle cx="50" cy="50" r="37" fill="none" stroke="#e08a1e" stroke-width="3.5" stroke-linecap="round"
+                :stroke-dasharray="C30" :stroke-dashoffset="off(37, s.real)" transform="rotate(-90 50 50)" />
+            </svg>
+            <div class="txt sp-txt">
+              <div class="spn">{{ s.label }}</div>
+              <div class="spv"><span class="tv teach">{{ s.teach }}</span><span class="tv real">{{ s.real }}</span></div>
+            </div>
+          </div>
+        </transition-group>
+
+        <button class="reset-btn" @click.stop="resetView"><SIcon name="compass" :size="13" /> 复位</button>
+        <div class="legend">
+          <span class="lg"><i class="sw teach" />教学</span>
+          <span class="lg"><i class="sw real" />实战</span>
+        </div>
+
+        <transition name="pop">
+          <div v-if="focused" class="crumb" @click.stop="collapse">
+            <span class="c-dot" :style="{ background: focused.color }" />{{ focused.id }} · {{ focused.name }}
+            <span class="c-back">返回总览</span>
+          </div>
+        </transition>
+
+        <transition name="pop">
+          <div v-if="selected" class="pop-card" :style="popStyle" @click.stop>
+            <div class="pc-head">
+              <span class="pc-id">{{ selected.id }}</span>
+              <span v-if="!selected.bridge" class="pc-cp" :class="selected.cp">{{ selected.cp === 'B' ? '问题应对' : '动作' }}</span>
+            </div>
+            <div class="pc-name">{{ selected.name }}</div>
+            <div class="pc-rows">
+              <template v-if="!selected.bridge">
+                <div class="pc-row"><i class="sw teach" />教学掌握度<b>{{ selected.teach }}%</b></div>
+                <div class="pc-row"><i class="sw real" />实战掌握度<b>{{ selected.real }}%</b></div>
+              </template>
+              <div v-else class="pc-desc">{{ selected.desc }}</div>
+            </div>
+            <div v-if="(selected.events || []).length" class="pc-events">
+              <div class="pc-ev-title">涉及突发事件</div>
+              <div v-for="e in selected.events" :key="e.code" class="pc-ev" :class="{ off: !e.unlocked }">
+                <i class="ev-dot" /><span class="ev-name">{{ e.title }}</span>
+                <span class="ev-tag">{{ e.unlocked ? '已解锁' : '未解锁' }}</span>
+              </div>
+              <div v-if="(selected.events || []).some((e: any) => !e.unlocked)" class="pc-ev-hint">
+                教学掌握度达到 60% 后解锁对应事件。
+              </div>
+            </div>
+            <div v-else class="pc-ev-none">本技能点不涉及突发事件</div>
+            <div class="pc-acts">
+              <router-link v-if="focused && focused.id === 'BRIDGE'" class="tc-btn pc-btn"
+                :to="`/learn/thread/C8.2`">进入学习</router-link>
+              <button v-else class="tc-btn pc-btn" @click.stop="enter(selected.id)">进入学习</button>
+              <router-link v-if="selected.bridge" class="tc-btn ghost pc-btn"
+                :to="`/learn/bridge/${selected.id}`">看内容</router-link>
+            </div>
+          </div>
+        </transition>
       </div>
-
-      <transition name="pop">
-        <div v-if="focused" class="crumb" @click.stop="collapse">
-          <span class="c-dot" :style="{ background: focused.color }" />{{ focused.id }} · {{ focused.name }}
-          <span class="c-back">返回总览</span>
-        </div>
-      </transition>
-
-      <transition name="pop">
-        <div v-if="selected" class="pop-card" :style="popStyle" @click.stop>
-          <div class="pc-head">
-            <span class="pc-id">{{ selected.id }}</span>
-            <span v-if="!selected.bridge" class="pc-cp" :class="selected.cp">{{ selected.cp === 'B' ? '问题应对' : '动作' }}</span>
-          </div>
-          <div class="pc-name">{{ selected.name }}</div>
-          <div class="pc-rows">
-            <template v-if="!selected.bridge">
-              <div class="pc-row"><i class="sw teach" />教学掌握度<b>{{ selected.teach }}%</b></div>
-              <div class="pc-row"><i class="sw real" />实战掌握度<b>{{ selected.real }}%</b></div>
-            </template>
-
-            <div v-else class="pc-desc">{{ selected.desc }}</div>
-          </div>
-          <div v-if="(selected.events || []).length" class="pc-events">
-            <div class="pc-ev-title">涉及突发事件</div>
-            <div v-for="e in selected.events" :key="e.code" class="pc-ev" :class="{ off: !e.unlocked }">
-              <i class="ev-dot" />
-              <span class="ev-name">{{ e.title }}</span>
-              <span class="ev-tag">{{ e.unlocked ? '已解锁' : '未解锁' }}</span>
-            </div>
-            <div v-if="(selected.events || []).some((e: any) => !e.unlocked)" class="pc-ev-hint">
-              教学掌握度达到 60% 后解锁对应事件。
-            </div>
-          </div>
-          <div v-else class="pc-ev-none">本技能点不涉及突发事件</div>
-          <div class="pc-acts">
-            <router-link v-if="focused && focused.id === 'BRIDGE'" class="tc-btn pc-btn"
-              :to="`/learn/thread/C8.2`">进入学习</router-link>
-            <button v-else class="tc-btn pc-btn" @click.stop="enter(selected.id)">进入学习</button>
-            <router-link v-if="selected.bridge" class="tc-btn ghost pc-btn"
-              :to="`/learn/bridge/${selected.id}`">看内容</router-link>
-            <router-link v-if="selected.bridge" class="tc-btn pc-btn"
-              :to="`/learn/thread/C8.2`">进入跨文化训练</router-link>
-          </div>
-        </div>
-      </transition>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import client from '@/api/client'
 import { useUserStore } from '@/stores/user'
 import SIcon from '@/components/SIcon.vue'
 
 const router = useRouter()
+const pageRoute = useRoute()
 const SIZE = 1600
 const CX = SIZE / 2
 const CY = SIZE / 2
@@ -145,6 +252,70 @@ const raw = ref<any[]>([])
 const userStore = useUserStore()
 const focusedId = ref('')
 const selected = ref<any>(null)
+const mode = ref<'tree' | 'route'>(pageRoute.query.mode === 'tree' ? 'tree' : 'route')
+const treeMode = computed(() => mode.value === 'tree')
+const route = ref<any>(null)
+const routeLoading = ref(false)
+const routeBusy = ref(false)
+const routeError = ref('')
+const routeDemand = ref('')
+const adjustOpen = ref(false)
+const adjustText = ref('')
+const priorityItem = computed<any>(() => route.value?.items?.[0] || null)
+const remainingTiers = computed(() => (route.value?.tiers || []).map((tier: any) => ({
+  ...tier,
+  items: (tier.items || []).filter((item: any) => item.order > 1),
+})).filter((tier: any) => tier.items.length))
+
+async function loadRoute() {
+  routeLoading.value = true
+  routeError.value = ''
+  try {
+    const r = (await client.get(`/profiles/${userStore.userId}/learning-route`)).data
+    route.value = r.route || null
+    if (route.value?.demand) routeDemand.value = route.value.demand
+  } catch (e: any) {
+    routeError.value = e?.response?.data?.detail || '学习路线暂时无法读取'
+  } finally { routeLoading.value = false }
+}
+
+async function generateRoute(force = false) {
+  if (routeBusy.value) return
+  if (!force && route.value) return
+  routeBusy.value = true
+  routeError.value = ''
+  try {
+    const r = (await client.post(`/profiles/${userStore.userId}/learning-route`, {
+      demand: routeDemand.value.trim(),
+    })).data
+    route.value = r.route
+    if (r.route?.demand) routeDemand.value = r.route.demand
+  } catch (e: any) {
+    routeError.value = e?.response?.data?.detail || '路线生成失败，请稍后重试'
+  } finally { routeBusy.value = false }
+}
+
+async function reviseRoute() {
+  const message = adjustText.value.trim()
+  if (!message || routeBusy.value) return
+  routeBusy.value = true
+  routeError.value = ''
+  try {
+    const r = (await client.post(`/profiles/${userStore.userId}/learning-route/revise`, { message })).data
+    route.value = r.route
+    routeDemand.value = r.route?.demand || routeDemand.value
+    adjustText.value = ''
+  } catch (e: any) {
+    routeError.value = e?.response?.data?.detail || '路线调整失败，请稍后重试'
+  } finally { routeBusy.value = false }
+}
+
+function setMode(next: 'tree' | 'route') {
+  mode.value = next
+  router.replace({ path: pageRoute.path, query: { ...pageRoute.query, mode: next } })
+  if (next === 'tree') nextTick(fitOverview)
+  else void loadRoute()
+}
 
 const COLORS: Record<string, string> = {
   C1: '#2577e3', C2: '#12a76a', C3: '#7a5af8', C4: '#e08a1e',
@@ -317,8 +488,9 @@ onMounted(async () => {
     raw.value = dimList
     overall.value = res.overall || { teach: 0, real: 0 }
   } catch { raw.value = [] }
+  await loadRoute()
   await nextTick()
-  fitOverview()
+  if (mode.value === 'tree') fitOverview()
   window.addEventListener('resize', onResize)
   wrapRef.value?.addEventListener('wheel', onWheel, { passive: false })
 })
@@ -331,9 +503,104 @@ onUnmounted(() => {
 <style scoped lang="scss">
 @use '@/styles/tokens.scss' as *;
 
+.learn-page { display: flex; flex-direction: column; gap: 14px; width: 100%; }
+.learn-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 18px; padding: 4px 2px 2px; }
+.lh-copy { min-width: 0; }
+.lh-kicker { color: #7b91ae; font-size: 11px; font-weight: 800; letter-spacing: .16em; }
+.lh-copy h2 { margin: 5px 0 2px; font-size: 28px; line-height: 1.2; color: #17243a; }
+.lh-copy p { margin: 0; color: #74849a; font-size: 14px; line-height: 1.6; }
+.mode-switch { flex-shrink: 0; display: inline-flex; padding: 4px; gap: 4px; border-radius: 12px; border: 1px solid #dbe5f1; background: #edf3fa; }
+.mode-switch button { display: inline-flex; align-items: center; gap: 7px; height: 36px; padding: 0 14px; border: 1px solid transparent; border-radius: 9px;
+  background: transparent; color: #687b93; font: inherit; font-size: 14px; cursor: pointer; white-space: nowrap; transition: all .16s ease; }
+.mode-switch button:hover { color: #2577e3; }
+.mode-switch button.on { background: #fff; color: #1f5fb8; border-color: #c5daf5; box-shadow: 0 3px 8px rgba(35,80,138,.09); font-weight: 700; }
+.route-shell { min-height: calc(100vh - 300px); border: 1px solid #e3e9f1; border-radius: 16px; padding: 20px;
+  background: linear-gradient(180deg, #f8fbfe 0%, #f2f6fb 100%); }
+.route-state { min-height: 220px; display: flex; align-items: center; justify-content: center; gap: 9px; color: #73869e; font-size: 15px; }
+.route-state.error { color: #b5473d; }
+.loading-ring { width: 20px; height: 20px; border-radius: 50%; border: 2px solid #c9ddf5; border-top-color: #2577e3; animation: spin .8s linear infinite; }
+.route-empty { max-width: 680px; margin: 72px auto; padding: 34px; text-align: center; border-radius: 16px; background: #fff; border: 1px solid #dee8f4; box-shadow: 0 16px 48px rgba(37,78,133,.08); }
+.re-icon { width: 48px; height: 48px; margin: 0 auto 12px; display: grid; place-items: center; border-radius: 14px; color: #2577e3; background: #eaf3fe; }
+.route-empty h3 { margin: 0 0 7px; font-size: 22px; color: #1c2e47; }
+.route-empty p { margin: 0 0 16px; color: #788aa1; line-height: 1.7; }
+.route-empty textarea { width: 100%; border: 1px solid #d5e0ed; border-radius: 10px; padding: 11px 13px; font: inherit; font-size: 15px; line-height: 1.6; resize: vertical; outline: none; }
+.route-empty textarea:focus { border-color: #2577e3; box-shadow: 0 0 0 3px rgba(37,119,227,.1); }
+.re-actions { display: flex; justify-content: center; gap: 9px; margin-top: 12px; flex-wrap: wrap; }
+.tc-btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 38px; padding: 0 15px; border: 1px solid transparent; border-radius: 8px; font: inherit; font-size: 14px; cursor: pointer; }
+.tc-btn.primary { color: #fff; background: #2577e3; box-shadow: 0 5px 14px rgba(37,119,227,.22); }
+.tc-btn.primary:hover:not(:disabled) { background: #1a63c4; }
+.tc-btn.ghost { color: #3f5c7d; background: #fff; border-color: #d8e2ee; }
+.tc-btn.ghost:hover:not(:disabled) { color: #2577e3; border-color: #a9cafa; }
+.tc-btn:disabled { opacity: .5; cursor: default; }
+.mini { border: 1px solid #d9e3ef; background: #fff; color: #3f5c7d; border-radius: 7px; padding: 5px 10px; font: inherit; font-size: 13px; cursor: pointer; }
+.priority-hero { position: relative; isolation: isolate; overflow: hidden; min-height: 330px; display: grid; grid-template-columns: 108px minmax(0,1fr) 140px; grid-template-rows: auto 1fr auto; gap: 12px 20px; padding: 28px 32px 26px; border-radius: 22px;
+  border: 1px solid #f0d9b9; background: linear-gradient(125deg, #fffdf8 0%, #fff8ed 42%, #edf5ff 100%); box-shadow: 0 22px 60px rgba(48,88,140,.13), inset 0 1px 0 #fff;
+  animation: heroIn .55s cubic-bezier(.2,.8,.2,1) both; }
+.priority-hero::before { content: ''; position: absolute; z-index: -1; width: 380px; height: 380px; right: -100px; top: -145px; border-radius: 50%; background: radial-gradient(circle, rgba(224,138,30,.22), rgba(224,138,30,0) 68%); animation: glowBreath 6s ease-in-out infinite alternate; }
+.priority-hero::after { content: ''; position: absolute; inset: 0; z-index: -1; background: linear-gradient(105deg, transparent 30%, rgba(255,255,255,.55) 46%, transparent 62%); transform: translateX(-110%); animation: sheen 6.5s ease-in-out 1.1s infinite; }
+.ph-actions { grid-column: 3; grid-row: 1; display: flex; justify-content: flex-end; align-items: flex-start; gap: 8px; flex-wrap: wrap; position: relative; z-index: 2; }
+.ph-actions .tc-btn { background: rgba(255,255,255,.78); backdrop-filter: blur(6px); }
+.ph-number { grid-column: 1; grid-row: 1 / 4; align-self: center; color: #e08a1e; font-size: 76px; line-height: 1; font-weight: 900; letter-spacing: -.08em; text-shadow: 0 8px 28px rgba(224,138,30,.15); animation: numberIn .7s .08s cubic-bezier(.2,.8,.2,1) both; }
+.ph-copy { grid-column: 2; grid-row: 1 / 3; align-self: center; min-width: 0; position: relative; z-index: 2; }
+.ph-copy h1 { margin: 0; max-width: 920px; color: #162a44; }
+.ph-copy h1 span { display: block; font-size: 19px; line-height: 1.5; font-weight: 650; color: #b46b10; letter-spacing: .01em; }
+.ph-copy h1 strong { display: block; margin-top: 9px; font-size: clamp(34px, 4vw, 54px); line-height: 1.18; letter-spacing: -.035em; color: #172a44; }
+.ph-tags { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 18px; }
+.ph-tags span { border-radius: 999px; padding: 6px 12px; font-size: 14px; font-weight: 650; color: #36506d; background: rgba(255,255,255,.75); border: 1px solid rgba(183,202,225,.75); }
+.ph-tags span:first-child { color: #b4690e; border-color: #efcf9e; background: #fff7e9; font-family: ui-monospace, Consolas, monospace; }
+.ph-score { grid-column: 3; grid-row: 2; align-self: center; justify-self: end; width: 120px; height: 120px; border-radius: 50%; display: flex; flex-direction: column; align-items: center; justify-content: center; color: #a85f08; background: radial-gradient(circle at 35% 28%, #fff, #fff4df 58%, #ffe6bd); border: 1px solid #f2d3a2; box-shadow: 0 14px 30px rgba(209,130,25,.16); position: relative; z-index: 2; animation: scoreIn .65s .16s cubic-bezier(.2,.8,.2,1) both; }
+.ph-score b { font-size: 39px; line-height: 1; font-weight: 900; letter-spacing: -.05em; }
+.ph-score span { margin-top: 7px; font-size: 14px; font-weight: 700; }
+.ph-start { grid-column: 2 / 4; grid-row: 3; justify-self: start; display: inline-flex; align-items: center; gap: 10px; margin-top: 10px; padding: 12px 20px; border: 0; border-radius: 11px; cursor: pointer; color: #fff; background: linear-gradient(135deg, #f0a02f, #d97908); font: inherit; font-size: 16px; font-weight: 800; box-shadow: 0 10px 24px rgba(217,121,8,.26); transition: transform .16s ease, box-shadow .16s ease; animation: startIn .55s .24s cubic-bezier(.2,.8,.2,1) both; }
+.ph-start:hover { transform: translateY(-2px); box-shadow: 0 14px 30px rgba(217,121,8,.34); }
+.route-stream { margin-top: 26px; animation: streamIn .45s .18s cubic-bezier(.2,.8,.2,1) both; }
+.stream-title { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 0 6px 13px; color: #243a57; font-size: 21px; font-weight: 800; }
+.stream-title b { color: #2577e3; font-size: 15px; border-radius: 999px; background: #eef5ff; padding: 5px 11px; }
+.route-lane { position: relative; padding-left: 14px; }
+.route-lane::before { content: ''; position: absolute; left: 24px; top: 20px; bottom: 24px; width: 3px; border-radius: 99px; background: linear-gradient(#e08a1e, #2577e3 36%, #12a76a 68%, #aebbc9); transform-origin: top; animation: lineGrow .8s .25s cubic-bezier(.25,.8,.25,1) both; }
+.route-tier { position: relative; margin-bottom: 26px; }
+.tier-head { display: flex; align-items: center; gap: 10px; margin: 0 0 10px; padding-left: 4px; }
+.tier-dot { width: 14px; height: 14px; flex-shrink: 0; border-radius: 50%; background: var(--tier); box-shadow: 0 0 0 5px color-mix(in srgb, var(--tier) 14%, white); }
+.tier-head h4 { margin: 0; color: #26384f; font-size: 17px; }
+.tier-count { margin-left: auto; color: var(--tier); border: 1px solid color-mix(in srgb, var(--tier) 30%, white); background: color-mix(in srgb, var(--tier) 8%, white); border-radius: 999px; padding: 3px 10px; font-size: 13px; font-weight: 800; }
+.tier-items { display: flex; flex-direction: column; gap: 9px; padding-left: 32px; }
+.route-item { position: relative; display: grid; grid-template-columns: 46px minmax(0,1fr) 54px 18px; gap: 14px; align-items: center; padding: 14px 16px 14px 12px; border-radius: 14px; border: 1px solid #e1e8f1; background: #fff; cursor: pointer; transition: border-color .18s ease, transform .18s ease, box-shadow .18s ease; animation: itemIn .4s var(--delay) cubic-bezier(.2,.8,.2,1) both; }
+.route-item::before { content: ''; position: absolute; left: -28px; top: 50%; width: 20px; border-top: 1px dashed color-mix(in srgb, var(--tier) 58%, #d9e1eb); }
+.route-item:hover { transform: translateX(4px); border-color: color-mix(in srgb, var(--tier) 52%, #d8e2ed); box-shadow: 0 10px 24px rgba(37,72,120,.09); }
+.ri-order { width: 40px; height: 40px; border-radius: 12px; display: grid; place-items: center; background: color-mix(in srgb, var(--tier) 10%, white); color: var(--tier); font-size: 15px; font-weight: 900; font-variant-numeric: tabular-nums; }
+.ri-main { min-width: 0; }
+.ri-meta { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; margin-top: 6px; color: #5f7894; font-size: 13px; font-weight: 600; }
+.ri-id { color: var(--tier); font-family: ui-monospace, Consolas, monospace; font-weight: 800; background: color-mix(in srgb, var(--tier) 8%, white); border-radius: 6px; padding: 2px 7px; }
+.ri-main h5 { margin: 0; color: #1f3149; font-size: 17px; line-height: 1.4; }
+.ri-score { justify-self: end; color: #263b57; font-size: 22px; font-weight: 900; line-height: 1; font-variant-numeric: tabular-nums; }
+.ri-arrow { color: #a9b7c8; transition: color .16s ease, transform .16s ease; }
+.route-item:hover .ri-arrow { color: var(--tier); transform: translateX(2px); }
+@keyframes heroIn { from { opacity: 0; transform: translateY(18px) scale(.985); } to { opacity: 1; transform: none; } }
+@keyframes numberIn { from { opacity: 0; transform: translateX(-16px); } to { opacity: 1; transform: none; } }
+@keyframes scoreIn { from { opacity: 0; transform: scale(.7) rotate(-8deg); } to { opacity: 1; transform: none; } }
+@keyframes startIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+@keyframes streamIn { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: none; } }
+@keyframes lineGrow { from { transform: scaleY(0); } to { transform: scaleY(1); } }
+@keyframes itemIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+@keyframes glowBreath { from { transform: scale(.94); opacity: .72; } to { transform: scale(1.08); opacity: 1; } }
+@keyframes sheen { 0%, 45% { transform: translateX(-110%); } 62%, 100% { transform: translateX(110%); } }
+.route-dialog-mask { position: fixed; inset: 0; z-index: 80; display: grid; place-items: center; padding: 20px; background: rgba(16,29,47,.44); backdrop-filter: blur(3px); }
+.route-dialog { width: min(640px, 100%); max-height: 82vh; display: flex; flex-direction: column; border-radius: 16px; background: #fff; box-shadow: 0 28px 80px rgba(14,34,60,.3); overflow: hidden; }
+.route-dialog > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 20px 22px 14px; border-bottom: 1px solid #e7edf5; }
+.rd-kicker { color: #2577e3; font-size: 11px; font-weight: 800; letter-spacing: .12em; }
+.route-dialog h3 { margin: 4px 0 0; font-size: 21px; color: #1d304a; }
+.close-btn { border: 0; background: none; color: #8d9cae; cursor: pointer; padding: 2px; }
+.rd-log { flex: 1; min-height: 150px; max-height: 320px; overflow-y: auto; padding: 16px 22px; display: flex; flex-direction: column; gap: 10px; background: #fafcff; }
+.rd-msg { max-width: 86%; border-radius: 12px; padding: 10px 12px; background: #edf4fd; }
+.rd-msg.user { align-self: flex-end; background: #fff3e3; }
+.rd-msg > span { color: #8899ad; font-size: 11px; font-weight: 700; }
+.rd-msg p { margin: 4px 0 0; color: #344a64; font-size: 14px; line-height: 1.65; }
+.route-dialog > textarea { margin: 14px 22px 0; min-height: 88px; resize: vertical; border: 1px solid #d5e0ed; border-radius: 10px; padding: 11px 13px; font: inherit; font-size: 14px; line-height: 1.6; outline: none; }
+.route-dialog > textarea:focus { border-color: #2577e3; box-shadow: 0 0 0 3px rgba(37,119,227,.1); }
+.rd-actions { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 14px 22px 20px; color: #93a0b2; font-size: 12px; }
 .map-wrap {
   overflow: hidden; border-radius: $radius-lg; cursor: grab; position: relative;
-  height: calc(100vh - 240px); min-height: 520px;
+  height: calc(100vh - 302px); min-height: 520px;
   background:
     radial-gradient(circle at 50% 50%, rgba(37,119,227,0.09), transparent 52%),
     radial-gradient(circle at 50% 50%, #f8fbfe, #edf2f9);
@@ -420,4 +687,34 @@ onUnmounted(() => {
   z-index: 7;
 }
 .pop-leave-to { opacity: 0; transform: translate(-50%, -50%) scale(.45); }
+</style>
+<style scoped lang="scss">
+@media (max-width: 760px) {
+  .learn-head { align-items: flex-start; flex-direction: column; }
+  .mode-switch { width: 100%; }
+  .mode-switch button { flex: 1; justify-content: center; }
+  .route-shell { padding: 12px; }
+  .priority-hero { min-height: 0; grid-template-columns: 62px minmax(0,1fr) 72px; padding: 20px 17px 18px; gap: 10px 12px; border-radius: 17px; }
+  .ph-actions { grid-column: 1 / -1; grid-row: 1; justify-content: flex-start; position: static; }
+  .ph-number { grid-column: 1; grid-row: 2 / 4; font-size: 50px; }
+  .ph-copy { grid-column: 2 / 4; grid-row: 2; }
+  .ph-copy h1 span { font-size: 15px; }
+  .ph-copy h1 strong { font-size: 30px; margin-top: 6px; }
+  .ph-tags { margin-top: 12px; gap: 6px; }
+  .ph-tags span { padding: 4px 8px; font-size: 12px; }
+  .ph-score { grid-column: 2; grid-row: 3; justify-self: start; width: 74px; height: 74px; }
+  .ph-score b { font-size: 26px; }
+  .ph-score span { font-size: 11px; margin-top: 3px; }
+  .ph-start { grid-column: 2 / 4; grid-row: 4; justify-self: stretch; justify-content: center; align-self: center; margin-top: 2px; padding: 11px 12px; font-size: 14px; white-space: nowrap; }
+  .stream-title { font-size: 18px; }
+  .route-item { grid-template-columns: 38px minmax(0,1fr) 36px 14px; gap: 9px; padding: 12px 10px; }
+  .ri-order { width: 34px; height: 34px; border-radius: 10px; }
+  .ri-main h5 { font-size: 15px; }
+  .ri-score { font-size: 18px; }
+  .rd-actions { align-items: flex-start; flex-direction: column; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .priority-hero, .priority-hero::before, .priority-hero::after, .ph-number, .ph-score, .ph-start,
+  .route-stream, .route-lane::before, .route-item { animation: none !important; }
+}
 </style>

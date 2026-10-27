@@ -27,7 +27,7 @@ def make(with_guard: bool = True):
 class FakeFeedback:
     """假的客户 Agent：把交付物内容回显一小段，便于断言路由。"""
 
-    def deliverable_feedback(self, kind, content, customer="客户"):
+    def deliverable_feedback(self, kind, content, customer="客户", order_id=""):
         return {"kind": kind, "customer": customer, "reply": f"收到你的{kind}",
                 "sentiment": "满意", "asks": ["能不能再确认一下日期？"]}
 
@@ -146,6 +146,8 @@ def test_targets_can_be_chosen_explicitly():
     oid = "9000000000000004"          # 浙江单，已在「客户确认合同」阶段（行前）
     sup = SupplierService(store, practice=practice)
     sup.add_contact(oid, "地接社")
+    hub = sup.ensure_hub("u-demo", oid)
+    sup.respond(hub["session_id"], "需要导游", target_role="地接社")
     sup.add_contact(oid, "导游")
     guide = sup.group_for(oid, "guide")
     out = svc.submit(oid, "departure_notice", {
@@ -169,8 +171,7 @@ def test_submit_blocked_by_arithmetic_does_not_record_anything():
 
 def test_submit_records_evidence_action_and_advances():
     store, practice, svc = make()
-    practice.record_action(ORDER, "grab")
-    practice.record_action(ORDER, "first_call")
+    _unlock_customer(store, practice, ORDER)
     out = svc.submit(ORDER, "requirement_sheet", {
         "guest": "客户 F", "people": "3 大 1 小", "dates": "11 月 12 日–16 日",
         "must": "四星、含大交通", "budget": "人均 5000-6000",
@@ -230,6 +231,7 @@ def test_conditional_actions_only_fire_on_expected_value():
 
 def test_resubmit_bumps_version():
     store, practice, svc = make()
+    _unlock_customer(store, practice, ORDER)
     values = {"guest": "客户 F", "people": "3 大 1 小", "dates": "11 月 12 日",
               "must": "四星", "budget": "人均 5000-6000"}
     svc.submit(ORDER, "requirement_sheet", values)
@@ -255,6 +257,7 @@ def test_files_are_stored_and_referenced():
 
 def test_list_for_order_marks_submitted():
     store, practice, svc = make()
+    _unlock_customer(store, practice, ORDER)
     svc.submit(ORDER, "requirement_sheet", {"guest": "客户 F", "people": "3 大 1 小",
                                             "dates": "11 月 12 日", "must": "四星",
                                             "budget": "人均 5000-6000"})

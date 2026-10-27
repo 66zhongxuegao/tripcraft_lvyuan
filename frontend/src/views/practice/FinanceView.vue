@@ -20,7 +20,7 @@
         <span class="k-sub">{{ summary.revenue ? '取自分项报价单' : '未提交分项报价' }}</span>
       </div>
       <div class="kpi">
-        <span class="k-label">资源口径成本</span>
+        <span class="k-label">按资源方报价的成本</span>
         <span class="k-val">{{ money(summary.cost) }}</span>
         <span class="k-sub">{{ summary.cost_source }}<template v-if="summary.cost_estimated"> · {{ summary.cost_note }}</template></span>
       </div>
@@ -35,7 +35,7 @@
         <span class="k-sub">
           <span class="grade" :class="gradeClass">{{ summary.grade }}</span>
           <template v-if="hasRevenue">毛利率 {{ pct(summary.margin) }}</template>
-          <template v-else>暂无收入口径，请先提交分项报价</template>
+          <template v-else>暂无收入数据，请先提交分项报价</template>
         </span>
       </div>
     </div>
@@ -50,7 +50,7 @@
           <tr v-for="(it, i) in summary?.cost_items || []" :key="i">
             <td>{{ it.name }}</td><td class="muted">{{ it.qty }}</td><td class="num">{{ money(it.amount) }}</td>
           </tr>
-          <tr v-if="!(summary?.cost_items || []).length"><td colspan="3" class="empty">尚未向资源方询价，成本口径未建立</td></tr>
+          <tr v-if="!(summary?.cost_items || []).length"><td colspan="3" class="empty">尚未向资源方询价，还没有成本数据</td></tr>
         </tbody>
         <tfoot v-if="(summary?.cost_items || []).length">
           <tr><td>合计</td><td class="muted">{{ summary?.cost_source }}</td><td class="num strong">{{ money(summary?.cost) }}</td></tr>
@@ -85,7 +85,7 @@
     </section>
 
     <section v-if="(summary?.gaps || []).length" class="card sec">
-      <div class="sec-title"><SIcon name="chart" :size="14" /><span>自报口径 vs 实际账目</span></div>
+      <div class="sec-title"><SIcon name="chart" :size="14" /><span>自己登记的成本 vs 实际账目</span></div>
       <table class="tbl">
         <thead><tr><th>项目</th><th class="num">自报</th><th class="num">实际</th><th class="num">差异</th></tr></thead>
         <tbody>
@@ -110,8 +110,9 @@
           <span class="g-hint">{{ c.hint }}</span>
         </div>
       </div>
-      <button class="link-btn" @click="openDeliverables">
-        <SIcon name="filetext" :size="13" /> 去产出与投递填写「地接结算核对单」
+      <button class="link-btn" :disabled="!settlementCode" @click="openDeliverables">
+        <SIcon name="filetext" :size="13" />
+        {{ settlementCode ? `去填写「${settlementTitle}」` : '文档清单还在加载，请稍候' }}
       </button>
     </section>
   </div>
@@ -122,11 +123,11 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import SIcon from '@/components/SIcon.vue'
 import client from '@/api/client'
+import { useStages } from '@/composables/useStages'
 
 const route = useRoute()
 const router = useRouter()
 const orderId = computed(() => String(route.params.id || ''))
-const shortId = computed(() => orderId.value.slice(-4))
 
 const order = ref<any>({})
 const summary = ref<any>(null)
@@ -140,6 +141,16 @@ const hasRevenue = computed(() => Number(summary.value?.revenue || 0) > 0)
 const gateChecks = computed(() => gate.value.checks || [])
 const gateDone = computed(() => gate.value.done || 0)
 const gateTotal = computed(() => gate.value.total || 0)
+
+// 结算交付物按契约定位（tripcraft/contracts/stages.py 的 deliverable_stage），
+// 跳转用 code 而不是中文标题，工作台按 code 打开对应文档。
+const SETTLEMENT_CODE = 'settlement'
+const { stages: stageDefs, load: loadStages } = useStages()
+const settlementCode = computed(() => {
+  const stage = stageDefs.value.find((s) => (s.deliverables || []).includes(SETTLEMENT_CODE))
+  return stage ? SETTLEMENT_CODE : ''
+})
+const settlementTitle = computed(() => (settlementCode.value ? '地接结算核对单' : '结算交付物'))
 
 const gradeClass = computed(() => {
   const g = summary.value?.grade || ''
@@ -164,7 +175,8 @@ function pct(v: any) {
 }
 function goBack() { router.push(`/practice/orders/${orderId.value}`) }
 function openDeliverables() {
-  router.push(`/practice/orders/${orderId.value}/deliverables?code=地接结算核对单`)
+  if (!settlementCode.value) return
+  router.push(`/practice/orders/${orderId.value}/deliverables?code=${settlementCode.value}`)
 }
 
 async function load() {
@@ -209,7 +221,7 @@ async function settle() {
     settled.value = true
     toast.value = hadRevenue
       ? `已结账留档：实际毛利 ${money(r.profit)}，毛利率 ${pct(r.margin)}（已写入 S11 结算证据）`
-      : '未提交分项报价，本次仅留档成本口径'
+      : '未提交分项报价，本次仅记录成本'
     toastBad.value = Number(r.profit) < 0
   } catch (err: any) {
     toast.value = err?.response?.data?.detail || '结账失败'
@@ -217,7 +229,7 @@ async function settle() {
   } finally { busy.value = false }
 }
 
-onMounted(load)
+onMounted(() => { load(); loadStages() })
 watch(orderId, load)
 </script>
 
@@ -280,6 +292,7 @@ watch(orderId, load)
 .g-label { font-size: 15px; font-weight: 600; }
 .g-hint { font-size: 15px; color: $color-text-muted; }
 .link-btn { margin-top: 6px; display: inline-flex; align-items: center; gap: 6px; font-size: 15.5px; color: $color-primary; background: $color-primary-soft; border: none; border-radius: 8px; padding: 7px 12px; cursor: pointer; }
+.link-btn:disabled { opacity: .55; cursor: not-allowed; }
 
 .toast { margin-top: 10px; font-size: 15.5px; color: $color-primary; background: $color-primary-softer; border-radius: 8px; padding: 9px 12px; }
 .toast.bad { color: $color-danger; background: #fdf1f0; }

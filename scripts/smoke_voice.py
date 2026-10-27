@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 # 把 local.env 灌进环境变量（不打印任何密钥）
-for line in (ROOT / "local.env").read_text(encoding="utf-8").splitlines():
+for line in (ROOT / "local.env").read_text(encoding="utf-8-sig").splitlines():
     line = line.strip()
     if line and not line.startswith("#") and "=" in line:
         k, v = line.split("=", 1)

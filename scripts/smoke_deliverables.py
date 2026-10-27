@@ -9,7 +9,7 @@ import json
 import sys
 import urllib.request
 
-BASE = "http://127.0.0.1:18010"
+BASE = "http://127.0.0.1:18020"
 
 
 def call(method: str, path: str, body: dict | None = None, timeout: float = 300.0):

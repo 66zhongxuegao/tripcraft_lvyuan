@@ -6,7 +6,7 @@
 设计口径：
 - 动作要么由接口自动登记（抢单、首呼、交付物通过拦截网），要么由学员显式确认
   （客户已确认、合同已签、保险已买、定金到账…）——后者在真实平台里也是点按钮确认的。
-- 时限类门槛（如 1 小时内首呼）用「接单时间 → 动作时间」的差值判定。
+- 时限用「接单时间 → 动作时间」的差值考核；超时留痕，补做后允许推进。
 """
 
 from __future__ import annotations
@@ -18,10 +18,17 @@ from dataclasses import dataclass
 ACTION_LABELS: dict[str, str] = {
     "grab": "抢单",
     "first_call": "首呼",
+    # 交付物投递动作：必须与 contracts/deliverables_spec.py 的 auto_actions 逐一对应。
+    # 缺一个 label 的后果不是「少一行日志」——deliverable_service 只登记 is_known_action() 为真的动作，
+    # 漏登记会让该阶段的门槛证据链断掉（标准案例走到出团通知/结算/复盘时表现为 blocked_by_contract）。
     "deliverable:需求确认单": "投递需求确认单",
+    "deliverable:资源询价记录": "投递资源询价记录",
     "deliverable:行程方案": "投递行程方案",
     "deliverable:分项报价": "投递分项报价",
     "deliverable:合同与保险": "投递合同与保险",
+    "deliverable:出团通知书": "投递出团通知书",
+    "deliverable:地接结算核对单": "投递地接结算核对单",
+    "deliverable:回访与复盘记录": "投递回访与复盘记录",
     "guard_pass:分项报价": "报价通过双层拦截网",
     "customer_confirmed_plan": "客户确认方案",
     "contract_signed": "合同已生成",
@@ -63,7 +70,7 @@ from ..contracts.steps import STEP_EVIDENCE   # 13 步产出位置（提示 + �
 GATES: dict[int, tuple[Gate, ...]] = {
     0: (
         Gate("grab", "抢单成功", "在消息中心点「抢单」接手本单", where="消息中心 › 待接单"),
-        Gate("first_call", "1 小时内发起首呼", "拨打客户电话完成首呼", within_min=60,
+        Gate("first_call", "首呼已完成", "在派单时限内拨打客户电话；超时补做后可继续，时效单独考核", within_min=60,
              where="订单管理 › 打开该单 › 拨打电话"),
         Gate("deliverable:需求确认单", "需求确认单已产出", "填写需求确认单并投递",
              where="产出与投递 › 需求确认单（发客户群）"),

@@ -151,30 +151,83 @@ class FinanceService:
         # 定责动作本身要留痕：复盘要能引用「学员把哪一笔损失谈给了谁」，
         # 只留在台账里的话，评分 Agent 看不到学员做过什么。
         if self._practice is not None:
+            # 证据里写清「哪一笔损失谈给了哪个具体资源方」：复盘与评分要能指认责任方，
+            # 只写「资源方」的话标准案例里指认不出是酒店还是车队。
+            responsible = kind or ("我方" if bearer == "我方" else bearer)
             self._practice.record_evidence(
                 order_id, "定责",
                 f"【损失定责·{row['label']}】{amount:g} 元 → {bearer}"
-                f"（我方承担 {ours:g} 元）｜{msg}",
+                f"（责任方：{responsible}；我方承担 {ours:g} 元）｜{msg}",
                 ref=entry_id)
-        return {"entry": self._store.finance_entry(entry_id), "message": msg}
+        result = {"entry": self._store.finance_entry(entry_id), "message": msg,
+                  "supplier_kind": kind, "bearer": bearer}
+        return result
+
+    def resolve_supplier_kind(self, order_id: str, text: str,
+                              session_kind: str = "") -> str:
+        """把「学员在群里说的这句话」定位到具体资源方（供追偿归因）。
+
+        这是「资源大群追偿找不到具体资源方」的修复核心：
+        资源大群的会话 kind 是笼统的「资源方」，而台账里的 supplier_kind 是
+        酒店/车队/地接社/票务；不先定位就会出现「说了追偿但匹配不到任何台账项」。
+        规则：话里点名优先 → 会话本身就是具体资源方 → 该单只有一类待处理损失时用它。
+        """
+        from .supplier_service import CONCRETE_SUPPLIER_KINDS, mentioned_supplier_kind
+
+        named = mentioned_supplier_kind(text)
+        if named:
+            return named
+        if session_kind in CONCRETE_SUPPLIER_KINDS:
+            return session_kind
+        pending: list[str] = []
+        for e in self.entries(order_id):
+            kind = str(e.get("supplier_kind") or "")
+            if e.get("status") == "待处理" and kind and kind not in pending:
+                pending.append(kind)
+        return pending[0] if len(pending) == 1 else ""
 
     def maybe_attribute_from_chat(self, order_id: str, supplier_kind: str,
                                   text: str) -> dict | None:
         """学员在资源方群里谈追偿/赔付 → 按写死比例定责，并给一句资源方回复。
 
         这是「协调赔偿」的入口：学员得真的开口谈，不然损失全算在自己头上。
+        返回形状：
+        - None：没有待处理损失 / 这句话不是追偿或自担话术；
+        - {"need_supplier": [...], "message": ...}：待处理损失有多类而话里没指名，
+          要求学员点名（不替他猜是酒店还是车队）；
+        - decide() 结果：已定责，附带 resolved_supplier_kind / supplier_kind。
         """
-        pending = [e for e in self.entries(order_id)
-                   if e["status"] == "待处理" and e["supplier_kind"] == supplier_kind]
-        if not pending or not text:
+        if not text:
+            return None
+        pending_by_kind: dict[str, list[dict]] = {}
+        for e in self.entries(order_id):
+            if e["status"] == "待处理" and e.get("supplier_kind"):
+                pending_by_kind.setdefault(e["supplier_kind"], []).append(e)
+        if not pending_by_kind:
+            return None
+
+        resolved = supplier_kind if supplier_kind in pending_by_kind else ""
+        if not resolved:
+            resolved = self.resolve_supplier_kind(order_id, text, supplier_kind)
+        if not resolved:
+            if len(pending_by_kind) > 1:
+                return {"need_supplier": sorted(pending_by_kind),
+                        "message": "请指明向哪一家追偿：" + "、".join(sorted(pending_by_kind))
+                                   + "（在群里点名说清楚，责任才能落到具体资源方）"}
+            resolved = next(iter(pending_by_kind))
+
+        target_entries = pending_by_kind.get(resolved) or []
+        if not target_entries:
             return None
         if any(w in text for w in ABSORB_WORDS):        # 「我们自己承担」优先于追偿关键词
-            target, bearer = pending[0], "我方"
+            target, bearer = target_entries[0], "我方"
         elif any(w in text for w in RECOURSE_WORDS):
-            target, bearer = pending[0], "资源方"
+            target, bearer = target_entries[0], "资源方"
         else:
             return None
-        return self.decide(order_id, target["entry_id"], bearer)
+        result = self.decide(order_id, target["entry_id"], bearer)
+        result["supplier_kind"] = resolved
+        return result
 
     # ---------- 成本口径 ----------
 

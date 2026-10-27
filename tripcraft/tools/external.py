@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import os
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
@@ -24,14 +25,25 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def load_env() -> dict[str, str]:
+    """先读环境变量，再回退项目根 local.env（与 docs/DECISIONS.md D-024 口径一致）。
+
+    注意：环境变量必须**覆盖** local.env。此前本函数只读 local.env，导致按文档
+    「把 AMAP_API_KEY 设成环境变量」的部署方式失效，route() 会误报「缺少 AMAP_API_KEY」。
+    """
     env: dict[str, str] = {}
     p = ROOT / "local.env"
     if p.exists():
-        for line in p.read_text(encoding="utf-8").splitlines():
+        for line in p.read_text(encoding="utf-8-sig").splitlines():
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
                 k, v = line.split("=", 1)
                 env[k.strip()] = v.strip()
+    # 环境变量优先（只收常见的大写下划线形式，避免把无关变量灌进来）
+    for k, v in os.environ.items():
+        if not v:
+            continue
+        if k and k.upper() == k and k.replace("_", "").isalnum():
+            env[k] = v
     return env
 
 

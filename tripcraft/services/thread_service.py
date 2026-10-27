@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -20,10 +21,68 @@ from ..contracts.rubric import RUBRICS
 from ..contracts.culture_bridges import get as get_bridge
 from ..contracts.skill_points import SKILL_POINTS_BY_ID
 from ..storage.db import Store
+from ..orchestration import AgentResult, AgentTask, Blackboard, Conductor, Plan
 from .retrieval import get_retriever
 
 ROOT = Path(__file__).resolve().parents[2]
 KNOWLEDGE_DIR = ROOT / "data" / "knowledge"
+
+
+# ---------------- 判分链路的错误（带 HTTP 状态，由路由层映射） ----------------
+# P0：题目必须在服务端出题时就落库，判分只按 question_id 取回服务端题库。
+# 客户端无法通过自带 answer/reference 影响判分，也无法用别人的 question_id 作答。
+
+class QuizError(RuntimeError):
+    """判分链路错误基类。`status` 由路由层映射成 HTTP 状态码。"""
+
+    status = 400
+
+
+class QuizQuestionMissing(QuizError):
+    """请求体里没有 question_id（题目必须来自服务端出题）。"""
+
+    status = 400
+
+    def __init__(self, msg: str = "缺少 question_id：题目必须来自服务端出题") -> None:
+        super().__init__(msg)
+
+
+class QuizQuestionNotFound(QuizError):
+    """question_id 在服务端题库里不存在（含存档损坏）。"""
+
+    status = 404
+
+    def __init__(self, msg: str = "题目不存在或已失效，请重新出题") -> None:
+        super().__init__(msg)
+
+
+class QuizQuestionForbidden(QuizError):
+    """question_id 属于别的用户或别的技能点。"""
+
+    status = 403
+
+    def __init__(self, msg: str = "无权作答其他用户或其他技能点的题目") -> None:
+        super().__init__(msg)
+
+
+class QuizQuestionAnswered(QuizError):
+    """同一道题已经交过卷：同题只计分一次（幂等口径＝拒绝重复提交，不改任何分数与趋势）。"""
+
+    status = 409
+
+    def __init__(self, msg: str = "这道题已经交过了：同题只计分一次，请重新出题") -> None:
+        super().__init__(msg)
+
+
+QUIZ_ANSWER_KEYS = ("answer", "reference", "rubric_points", "explain")
+
+
+def strip_quiz_answers(card: dict | None) -> dict:
+    """题卡下发投影：剥掉答案与评分要点（服务层自身也做一遍，纵深防御）。"""
+    out = dict(card or {})
+    for key in QUIZ_ANSWER_KEYS:
+        out.pop(key, None)
+    return out
 
 ASSET_TYPES = {"lecture": "讲义", "guide": "实操指南", "report": "学习报告", "wrong_book": "错题本"}
 
@@ -152,8 +211,9 @@ QUESTION_SYSTEM = """你是实战出题老师，给学员出一道贴近真实�
 """
 
 
-ROUTER_SYSTEM = """你是定制师实训系统的核心调度器，由教师 Agent 指挥协作者。
-根据学员这句话，判断本轮需要调用哪些协作者 Agent（教师永远最后执行，不要列在 agents 里）：
+ROUTER_SYSTEM = """你是定制师实训系统的教学 Orchestra 调度器，由 Conductor 统一调用。
+根据学员这句话，判断本轮需要哪些协作者声部（教师 Agent 最后汇总输出，不是总指挥）：
+
 - retrieval：知识召回 —— 需要查知识点/规则/定义/步骤时
 - profile：画像顾问 —— 学员提到掌握度、薄弱点、复盘、下一步建议、我的学习情况时
 只列确实需要的；普通知识点提问通常只要 retrieval。
@@ -180,14 +240,67 @@ def _difficulty_of(level: str) -> str:
 
 
 class ThreadService:
-    def __init__(self, store: Store, llm: DeepSeekClient | None = None) -> None:
+    def __init__(self, store: Store, llm: DeepSeekClient | None = None,
+                 conductor: Conductor | None = None) -> None:
         self._store = store
         self._llm = llm
+        self._conductor = conductor or Conductor()
+        self._bind_agents()
 
     def _require_llm(self) -> DeepSeekClient:
         if self._llm is None:
             raise RuntimeError("未配置 LLM（缺少 DEEPSEEK_API_KEY）")
         return self._llm
+
+    # ---------- Multi-Agent Orchestra 绑定 ----------
+
+    def _bind_agents(self) -> None:
+        """把教学声部绑定到共享 Conductor；Agent 之间不互相调用。"""
+        self._conductor.registry.bind("teaching.router", self._agent_router)
+        self._conductor.registry.bind("teaching.retrieval", self._agent_retrieval)
+        self._conductor.registry.bind("teaching.context", self._agent_context)
+        self._conductor.registry.bind("teaching.profile", self._agent_profile)
+        self._conductor.registry.bind("teaching.teacher", self._agent_teacher)
+
+    def _agent_router(self, task: AgentTask, board: Blackboard) -> AgentResult:
+        message = str(task.payload.get("message") or "")
+        return AgentResult(task.id, task.agent, output={"agents": self._plan(message)})
+
+    def _agent_retrieval(self, task: AgentTask, board: Blackboard) -> AgentResult:
+        sp = str(task.payload.get("sp") or "")
+        query = str(task.payload.get("query") or "")
+        return AgentResult(task.id, task.agent, output=self._knowledge(sp, query))
+
+    def _agent_context(self, task: AgentTask, board: Blackboard) -> AgentResult:
+        ctx = self.build_context(
+            str(task.payload.get("user_id") or ""),
+            str(task.payload.get("sp") or ""),
+            query=str(task.payload.get("query") or ""),
+            knowledge=board.get("retrieval") or {},
+        )
+        return AgentResult(task.id, task.agent, output=ctx)
+
+    def _agent_profile(self, task: AgentTask, board: Blackboard) -> AgentResult:
+        ctx = board.get("context")
+        advice = self._profile_advice(
+            str(task.payload.get("user_id") or ""),
+            str(task.payload.get("sp") or ""),
+            ctx,
+        )
+        return AgentResult(task.id, task.agent, output={"advice": advice})
+
+    def _agent_teacher(self, task: AgentTask, board: Blackboard) -> AgentResult:
+        ctx = board.get("context")
+        profile = board.get("profile") or {}
+        out = self._teacher_reply(
+            str(task.payload.get("user_id") or ""),
+            str(task.payload.get("sp") or ""),
+            str(task.payload.get("message") or ""),
+            ctx,
+            str(profile.get("advice") or ""),
+        )
+        return AgentResult(task.id, task.agent, output=out,
+                           evidence=list(out.get("evidence") or []))
 
     # ---------- 上下文装配 ----------
 
@@ -223,12 +336,14 @@ class ThreadService:
             out.append({"order_id": o["order_id"], "summary": f"{o['customer']}·{o['destination']}，当前阶段 {o['stage_index'] + 1}/8"})
         return out
 
-    def build_context(self, user_id: str, sp: str, query: str = "") -> ThreadContext:
+    def build_context(self, user_id: str, sp: str, query: str = "",
+                      *, knowledge: dict | None = None) -> ThreadContext:
         thread = self._store.get_or_create_thread(user_id, sp)
         ab = self._store.abilities(user_id).get(sp, {})
         skill = SKILL_POINTS_BY_ID.get(sp)
         bridge = get_bridge(sp)
-        knowledge = self._knowledge(sp, query)
+        if knowledge is None:
+            knowledge = self._knowledge(sp, query)
         # 文化桥没有知识点基座文件，直接把桥的底座喂给教师，否则资料块是空的
         if bridge is not None and not (knowledge or {}).get("text"):
             knowledge = bridge_knowledge(bridge)
@@ -351,15 +466,11 @@ class ThreadService:
         out["kind"] = "chat"
         return out
 
-    def reply(self, user_id: str, sp: str, message: str) -> dict:
-        plan = self._plan(message)
-        ctx = self.build_context(user_id, sp, query=message)
+    def _teacher_reply(self, user_id: str, sp: str, message: str,
+                       ctx: ThreadContext, profile_advice: str = "") -> dict:
+        """主讲 Agent 的唯一输出口：汇总黑板，生成一次带来源的回答。"""
         thread = self._store.get_or_create_thread(user_id, sp)
         self._store.add_message(thread["thread_id"], "user", message)
-
-        profile_advice = ""
-        if "profile" in plan:
-            profile_advice = self._profile_advice(user_id, sp, ctx)
 
         context_text = ctx.render()
         if profile_advice:
@@ -377,8 +488,46 @@ class ThreadService:
         sources = ctx.sources()
         self._store.add_message(thread["thread_id"], "ai", content, sources)
         self._store.touch_thread(thread["thread_id"])
-        pipeline = [dict(AGENT_META[a]) for a in plan] + [dict(AGENT_META["teacher"])]
-        return {"content": content, "evidence": sources, "pipeline": pipeline, "profile_advice": profile_advice}
+        return {"content": content, "evidence": sources}
+
+    def reply(self, user_id: str, sp: str, message: str) -> dict:
+        """教学线程的统一 Orchestra 入口。"""
+        board = Blackboard({"user_id": user_id, "sp": sp, "message": message})
+        planner = AgentTask("plan", "teaching.router", "plan", {"message": message})
+
+        def build_plan(router_out, current):
+            agents = list((router_out or {}).get("agents") or [])
+            tasks = [
+                AgentTask("retrieval", "teaching.retrieval", "retrieve",
+                          {"sp": sp, "query": message}),
+                AgentTask("context", "teaching.context", "assemble",
+                          {"user_id": user_id, "sp": sp, "query": message},
+                          depends_on=("retrieval",)),
+            ]
+            if "profile" in agents:
+                tasks.append(AgentTask("profile", "teaching.profile", "advise",
+                                       {"user_id": user_id, "sp": sp},
+                                       depends_on=("context",), optional=True))
+            tasks.append(AgentTask("teacher", "teaching.teacher", "respond",
+                                   {"user_id": user_id, "sp": sp, "message": message},
+                                   depends_on=("context",)))
+            return Plan("teaching.reply", "teaching", tuple(tasks))
+
+        result = self._conductor.run_dynamic(planner, build_plan, board)
+        if not result.ok:
+            raise RuntimeError(result.error or "教学 Orchestra 执行失败")
+        teacher = result.outputs.get("teacher") or {}
+        profile = (result.outputs.get("profile") or {}).get("advice") or ""
+        plan_agents = list((result.outputs.get("plan") or {}).get("agents") or [])
+        pipeline = [dict(AGENT_META[a]) for a in plan_agents if a in AGENT_META]
+        pipeline.append(dict(AGENT_META["teacher"]))
+        return {
+            "content": teacher.get("content", ""),
+            "evidence": teacher.get("evidence", []),
+            "pipeline": pipeline,
+            "profile_advice": profile,
+            "orchestra": {"run_id": result.run_id, "trace": result.trace_dicts()},
+        }
 
     # ---------- 资产 ----------
 
@@ -444,24 +593,72 @@ class ThreadService:
             temperature=0.5, max_tokens=900)
         q["difficulty"] = j["difficulty"]
         q["judged_level"] = j["level"]
-        q["question_id"] = f"{sp}-{int(datetime.now().timestamp()*1000)}"
+        q["question_id"] = f"{sp}-{uuid.uuid4().hex}"
         q["pipeline"] = [{"id": "judge", "name": "掌握度判档"}, {"id": "question", "name": "Rubric 出题"}]
-        return q
+        # P0：题目与答案**只存服务端**。这里按 question_id 落库（带 user_id + 技能点归属），
+        # 下发前剥离答案；判分时按 question_id 取回这份存档，永不采信客户端传来的题目内容。
+        self._store.save_quiz_question(
+            q["question_id"], user_id, sp, q,
+            answer=str(q.get("answer") or ""), reference=str(q.get("reference") or ""))
+        return strip_quiz_answers(q)
 
     def submit_answer(self, user_id: str, sp: str, question: dict, answer: str) -> dict:
-        correct = False
-        explain = question.get("explain") or question.get("reference") or ""
-        if question.get("type") == "choice":
-            correct = str(answer).strip().upper()[:1] == str(question.get("answer", "")).strip().upper()[:1]
-        else:
-            res = self._require_llm().chat_json(
-                [{"role": "system", "content": "你是实战评判老师。判断学员的简答是否达标，并给出针对性的讲解（错了讲清为什么、该怎么改）。输出 JSON：{\"correct\":true,\"reason\":\"\"}"},
-                 {"role": "user", "content": f"题干：{question.get('stem')}\n参考答案：{question.get('reference')}\n学员答案：{answer}"}],
-                temperature=0.1, max_tokens=320)
-            correct = bool(res.get("correct"))
-            explain = str(res.get("reason") or explain)
+        """判分**只信服务端**：按 question_id 取回出题时落库的题卡，客户端传的一律忽略。
+
+        拒绝规则：缺 question_id → 400；不存在 → 404；属于别人或别的技能点 → 403。
+        客户端传来的 `stem` / `answer` / `reference` / `explain` 都不参与判分，
+        所以伪造答案键、篡改题干都无法改变判分结果。
+        """
+        qid = str((question or {}).get("question_id") or "").strip()
+        if not qid:
+            raise QuizQuestionMissing()
+        row = self._store.quiz_question(qid)
+        if not row:
+            raise QuizQuestionNotFound()
+        if (row.get("user_id") or "") != user_id or (row.get("skill_point_id") or "") != sp:
+            raise QuizQuestionForbidden()
+        try:
+            stored = json.loads(row.get("payload") or "{}")
+        except (TypeError, ValueError):
+            stored = {}
+        if not isinstance(stored, dict) or not stored:
+            # 存档坏了也不能「回退到信客户端」，直接拒绝
+            raise QuizQuestionNotFound("题目存档损坏，请重新出题")
+
+        # **幂等闸门（选择「拒绝重复提交」而不是幂等回放）**：
+        # 用单条带 WHERE 的 UPDATE 原子抢占；抢占失败＝这题已经交过卷。
+        # 为什么选 409 而不是幂等回放首次结果：
+        #   1) 回放需要在库里额外落一份完整判分结果（含讲解/难度/趋势），才可能与首次逐字一致；
+        #      否则「幂等」只是部分幂等，反而更难验证；
+        #   2) 409 语义明确：前端可以提示「这题已经交过，请出新题」，不会让用户误以为又被计分；
+        #   3) 关键不变量（不重复 add_attempt / set_ability / memory）在两种方案下完全相同。
+        # 无论选哪种，抢占失败后都**不得**再写 attempts、ability、memory —— 这样趋势与掌握度不会被打脏。
+        if not self._store.claim_quiz_question(qid):
+            first = "答对" if int(row.get("correct") or 0) == 1 else "答错"
+            raise QuizQuestionAnswered(
+                f"这道题已经交过了（首次判分：{first}）：同题只计分一次，请重新出题")
+
+        try:
+            correct = False
+            explain = str(stored.get("explain") or row.get("reference") or stored.get("reference") or "")
+            if str(stored.get("type") or "") == "choice":
+                # 学员的选项来自请求体（这是他的作答）；**正确答案只来自服务端存档**
+                correct = (str(answer).strip().upper()[:1]
+                           == str(stored.get("answer") or row.get("answer") or "").strip().upper()[:1])
+            else:
+                res = self._require_llm().chat_json(
+                    [{"role": "system", "content": "你是实战评判老师。判断学员的简答是否达标，并给出针对性的讲解（错了讲清为什么、该怎么改）。输出 JSON：{\"correct\":true,\"reason\":\"\"}"},
+                     {"role": "user", "content": f"题干：{stored.get('stem')}\n参考答案：{stored.get('reference') or row.get('reference')}\n学员答案：{answer}"}],
+                    temperature=0.1, max_tokens=320)
+                correct = bool(res.get("correct"))
+                explain = str(res.get("reason") or explain)
+        except Exception:
+            # 判分失败要把抢占还回去，否则这题会卡成「已作答但没判分」
+            self._store.release_quiz_claim(qid)
+            raise
         score = 92.0 if correct else 40.0
-        self._store.add_attempt(user_id, sp, question.get("question_id", ""), question, answer, correct, score)
+        # 落账的题目用**服务端存档**，不用客户端传的 question
+        self._store.add_attempt(user_id, sp, qid, stored, answer, correct, score)
 
         ab = self._store.abilities(user_id).get(sp, {})
         old = float(ab.get("teach") or 0)
@@ -471,8 +668,9 @@ class ThreadService:
         else:
             new = round(min(100.0, old + 7.0), 1) if correct else round(max(0.0, old - 9.0), 1)
         self._store.set_ability(user_id, sp, teach=new)
+        self._store.mark_quiz_answered(qid, correct)
         if not correct:
-            self._store.add_memory(user_id, "progress_note", f"{sp} 答错：{str(question.get('stem'))[:40]}", f"thread:{sp}")
+            self._store.add_memory(user_id, "progress_note", f"{sp} 答错：{str(stored.get('stem'))[:40]}", f"thread:{sp}")
         lvl = mastery_of(new)
         old_lvl = mastery_of(old)
         new_diff = _difficulty_of(lvl.value)
@@ -490,14 +688,14 @@ class ThreadService:
         # 判分结果按 question_id 挂回那张题卡：答过的题留在聊天记录里可回看
         try:
             thread = self._store.get_or_create_thread(user_id, sp)
-            payload = {"question_id": question.get("question_id", ""), "answer": answer,
+            payload = {"question_id": qid, "answer": answer,
                        "correct": correct, "explain": explain, "score": score,
                        "teach": new, "level": lvl.value, "difficulty": new_diff,
                        "prev_difficulty": old_diff, "trend": trend, "reteach": (not correct)}
             self._store.add_message(
                 thread["thread_id"], "ai",
                 f"{'答对' if correct else '答错'} · 掌握度 {new:.0f} · 难度 {new_diff}",
-                [f"quiz:{question.get('question_id', '')}"],
+                [f"quiz:{qid}"],
                 kind="quiz_result", payload=json.dumps(payload, ensure_ascii=False))
             self._store.touch_thread(thread["thread_id"])
         except Exception:

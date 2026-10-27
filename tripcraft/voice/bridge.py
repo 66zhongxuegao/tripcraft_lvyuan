@@ -32,7 +32,8 @@ from pathlib import Path
 from typing import Any
 
 from ..agents.customer import CustomerPersona
-from ..agents.customer import persona_for
+from ..agents.customer import persona_for, trip_intent
+from ..services.customer_order_facts import facts_from_order_row, facts_for_order_id
 from .language_profiles import LANG_COUNTRIES, VOICE_LANG
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -68,15 +69,16 @@ def pick_voice(lang: str, gender: str) -> str:
     return table["male"] if gender == "男" else table["female"]
 
 
-def build_scene(order_customer: str, destination: str, stage_name: str) -> dict[str, Any]:
+def build_scene(order_customer: str, destination: str, stage_name: str, source_market: str = "", facts: dict | None = None) -> dict[str, Any]:
     return {
-        "opening": f"定制师给你打电话，沟通来内地去{destination}的行程。",
+        "opening": "电话刚接通，由你先自然地接听一句；然后根据定制师说明的来意，沟通你自己的旅行安排。",
+        "trip_hint": trip_intent(destination, source_market, facts),
         "location": "电话沟通",
         "stage_title": stage_name or "首呼与需求挖掘",
-        "objective": "问清人数、日期、预算口径、住宿与交通意向，并约定后续联系时间",
+        "objective": "希望定制师理解自己的出行意向与实际限制，提供合适的行程建议，并商量后续联系安排",
         "situation": (
-            "你时间不多，说话直接；需求分批释放，第一次不会说全；"
-            "预算只说「性价比高」「别太贵」，除非对方专业地追问口径。"
+            "你正以客户身份咨询旅行安排，按自己的资料回答问题；"
+            "尚未确定的事项可以请对方给建议。语气、耐心与预算表达遵循具体人设及已知事实。"
         ),
     }
 
@@ -87,6 +89,21 @@ def build_persona(customer_name: str, destination: str, lang_label: str,
     和文本通话、群聊是同一份，避免同一个客人换条链路就换个人。"""
     p = persona_for(customer_name, destination, source_market, lang_label, order_id, personality)
     return p.voice_profile()
+
+
+def persona_view_from_order(order: dict | None) -> dict:
+    """语音通道的人设视图：唯一从订单行派生（R02）。
+
+    修复前这里传的是 `self.order.get("source_market", "")`——空客源地会让
+    `persona_for` 兜底成“中国”，与文本/IM 通道的“香港”默认口径不一致。
+    现在统一走 `services.customer_order_facts`。
+    """
+    return facts_from_order_row(order).persona_view()
+
+
+def load_order_facts(store, order_id: str):
+    """按订单号加载客户事实（语音入口用；避免调用方各自取字段）。"""
+    return facts_for_order_id(store, order_id)
 
 
 def map_event(ev: dict) -> dict | None:
@@ -120,16 +137,21 @@ def map_event(ev: dict) -> dict | None:
 
 
 class VoiceBridge:
-    """一次语音通话的中继会话。"""
+    """一次语音通话的中继会话，接收含 payload 的数据库原始订单行。"""
 
     def __init__(self, ws, order: dict, customer_name: str, destination: str,
-                 call_svc, practice) -> None:
+                 call_svc, practice, user_id: str = "") -> None:
+        if "payload" not in order:
+            raise ValueError("语音通话缺少完整订单资料，请重新加载订单后拨打")
         self.ws = ws
         self.order = order
         self.customer_name = customer_name
         self.destination = destination
         self.call_svc = call_svc
         self.practice = practice
+        self.store = getattr(call_svc, "_store", None) or getattr(practice, "_store", None)
+        # 真实登录用户：写进 call_session.user_id / AgentContext，不再写死演示账号
+        self.user_id = user_id or ""
         self.client: QwenRealtimeClient | None = None
         self.lines: list[dict] = []
         self._agent_buf = ""
@@ -151,17 +173,14 @@ class VoiceBridge:
         def on_event(ev: dict) -> None:
             loop.call_soon_threadsafe(queue.put_nowait, ev)
 
-        label = self.order.get("language", "中文")
+        # 客户事实唯一来源：订单行 → CustomerFacts（与文本/IM 同一套默认值、同一份订单事实）
+        facts = facts_for_order_id(self.store, self.order["order_id"])
+        label = facts.language
         lang = lang_code(label)
-        p = persona_for(self.customer_name, self.destination, self.order.get("source_market", ""),
-                        label, self.order.get("order_id", ""), self.order.get("personality", ""))
-        persona = p.voice_profile()
-        scene = build_scene(self.customer_name, self.destination, self.order.get("stage_name", ""))
-        scene["objective"] = (
-            "问清人数、日期、预算口径、住宿与交通意向，"
-            "确认客源地证件与入境是否顺畅，并约定后续联系时间与方式"
-        )
-        instructions = build_scene_voice_instructions(scene, persona, lang)
+        p = facts.persona_for()
+        from ..services.customer_context import GREETINGS, build_customer_system
+        instructions = build_customer_system(facts.order_id, "voice", store=self.store,
+                                             history=self.store.conversation_turns(facts.order_id, 10))
 
         try:
             api_key, ws_url, model = resolve_env()
@@ -169,11 +188,13 @@ class VoiceBridge:
             await self._send({"type": "error", "message": str(exc)})
             return
 
-        sess = self.call_svc.open_session(self.order["order_id"], self.customer_name,
-                                          self.destination, mode="voice",
-                                          source_market=self.order.get("source_market", "香港"),
-                                          language=label,
-                                          personality=self.order.get("personality", ""))
+        sess = self.call_svc.open_session(facts.order_id or self.order.get("order_id", ""),
+                                          facts.customer, facts.destination, mode="voice",
+                                          source_market=facts.source_market,
+                                          language=facts.language,
+                                          personality=facts.personality,
+                                          user_id=self.user_id,
+                                          facts=facts.model_facts())
         self.session_id = sess.session_id
 
         voice = pick_voice(lang, p.gender)
@@ -188,11 +209,13 @@ class VoiceBridge:
             self._trace("ready_timeout")
             return
 
-        # ready 里带上语言与人设：前端要显示「这通电话对方说什么语言」，也便于演示时讲解
+        # ready 里带上语言与人设：前端要显示「这通电话对方说什么语言」，也便于演示时讲解。
+        # 这里**只发公开字段**（public_dto.public_customer），隐藏诉求/性格细节一律不下发。
+        from ..api.public_dto import public_customer
+
         await self._send({"type": "ready", "session_id": self.session_id,
                           "lang": lang, "language": label, "voice": voice,
-                          "persona": {"name": p.name, "nationality": p.nationality,
-                                      "age": p.age, "gender": p.gender},
+                          "persona": public_customer(facts),
                           "input_rate": INPUT_RATE, "output_rate": OUTPUT_RATE})
 
         self.ready_ok = True
@@ -200,24 +223,102 @@ class VoiceBridge:
         self._mark_dialed()
 
         sender = asyncio.create_task(self._pump(queue))
+        recv = asyncio.create_task(self._receive())
         try:
+            # 电话接通后由客户先开口；否则模型会一直等学员先说话，前端看起来像“对方不说话”。
+            client.ask_text(GREETINGS.get(label, "Hello?"))
             while True:
-                raw = await self.ws.receive_text()
-                if not await self._handle(raw):
-                    break
+                done, _pending = await asyncio.wait(
+                    {sender, recv}, return_when=asyncio.FIRST_COMPLETED)
+                for t in done:
+                    exc = t.exception()
+                    if exc is not None:
+                        raise exc
+                if sender in done:
+                    break          # 上游事件泵结束/断开 → 收口落库
         except Exception:
             pass
         finally:
+            recv.cancel()
             sender.cancel()
             client.close()
             await self._finalize()
 
+    async def _receive(self) -> None:
+        """接收浏览器上行帧；断开或 stop 时返回（让 run() 收口落库）。"""
+        while True:
+            raw = await self.ws.receive_text()
+            if not await self._handle(raw):
+                return
+
     async def _pump(self, queue: asyncio.Queue) -> None:
+        from ..services.customer_card import check_reply
+        from ..services.customer_context import build_customer_system, fallback_reply
+        frames, transcript, deltas, byte_count, retry = [], "", "", 0, 0
         try:
             while True:
                 ev = await queue.get()
                 if ev is None:
                     return
+                event_type = ev.get("type", "")
+                if event_type == "session.updated":
+                    continue
+                if event_type == "response.created":
+                    frames, transcript, deltas, byte_count = [], "", "", 0
+                    await self._send({"type": "state", "value": "thinking"})
+                    continue
+                if event_type == "response.audio.delta":
+                    frame = map_event(ev)
+                    if frame:
+                        byte_count += len(frame.get("audio") or "")
+                        if byte_count <= 16 * 1024 * 1024:
+                            frames.append(frame)
+                    continue
+                if event_type == "response.audio_transcript.delta":
+                    deltas += str(ev.get("delta") or "")
+                    continue
+                if event_type == "response.audio_transcript.done":
+                    transcript += str(ev.get("transcript") or "")
+                    continue
+                if event_type == "response.done":
+                    transcript = (transcript or deltas).strip()
+                    card = self.store.ensure_customer_card(self.order["order_id"])
+                    question = getattr(self, "_last_student_question", "")
+                    issues = check_reply(transcript, card, question=question)
+                    if not transcript or byte_count > 16 * 1024 * 1024:
+                        issues.append({"key": "voice", "reason": "unverifiable_audio"})
+                    if issues:
+                        for issue in issues:
+                            self.store.record_customer_conflict(self.order["order_id"], issue, "voice",
+                                                               f"{self.session_id}:{len(self.lines)}:{retry}")
+                        if retry == 0 and self.client is not None:
+                            retry = 1
+                            correction = build_customer_system(self.order["order_id"], "voice", store=self.store)
+                            correction += "\n上一条回复已被拦截，未播放。请保持出游客户身份，按事实卡重新回答原问题；表达自己的需求或请定制师给建议，不采集定制师的旅行需求，不替对方提供服务。纠正：" + json.dumps(issues, ensure_ascii=False)
+                            self.client.update_instructions(correction)
+                            self.client.ask_text("请重新回答定制师的原话：" + question)
+                            frames, transcript, deltas, byte_count = [], "", "", 0
+                            continue
+                        # 不播放冲突音频；再次失败时用同一事实卡模板显示文字。
+                        transcript = fallback_reply(card, question)
+                        frames = []
+                    retry = 0
+                    await self._send({"type": "state", "value": "speaking"})
+                    self._agent(transcript)
+                    for frame in frames:
+                        self.audio_out_frames += 1
+                        self.audio_out_bytes += len(frame.get("audio") or "") * 3 // 4
+                        await self._send(frame)
+                    await self._send({"type": "transcript", "who": "agent", "text": transcript, "final": True})
+                    if issues:
+                        await self._send({"type": "state", "value": "idle", "message": "本轮已切换为文字回复"})
+                    await self._send({"type": "state", "value": "listening"})
+                    if self.client is not None:
+                        self.client.update_instructions(build_customer_system(
+                            self.order["order_id"], "voice", store=self.store,
+                            history=self.store.conversation_turns(self.order["order_id"], 10)))
+                    frames, transcript, deltas, byte_count = [], "", "", 0
+                    continue
                 line = transcript_line(ev)
                 if line is not None:
                     who, text = line
@@ -236,8 +337,9 @@ class VoiceBridge:
                 await self._send(mapped)
         except asyncio.CancelledError:
             raise
-        except Exception:
-            return
+        except Exception as exc:
+            self._trace("consistency_error")
+            await self._send({"type": "error", "message": "本轮语音处理未完成，请重新发起通话。"})
 
     async def _handle(self, raw: str) -> bool:
         try:
@@ -277,6 +379,7 @@ class VoiceBridge:
     # ---- 转写落库 ----
 
     def _student(self, text: str) -> None:
+        self._last_student_question = text
         if self.lines and self.lines[-1]["who"] == "student" and self.lines[-1]["text"] == text:
             return
         self.lines.append({"who": "student", "text": text})
@@ -286,6 +389,9 @@ class VoiceBridge:
                 self.call_svc.record_line(sess, "student", text)
 
     def _agent(self, text: str) -> None:
+        from ..services.customer_context import observe_reply
+        observe_reply(self.store, self.order["order_id"], text, "voice",
+                      f"{self.session_id}:voice:{len(self.lines)}", getattr(self, "_last_student_question", ""))
         if self.lines and self.lines[-1]["who"] == "agent" and self.lines[-1]["text"] == text:
             return
         self.lines.append({"who": "agent", "text": text})

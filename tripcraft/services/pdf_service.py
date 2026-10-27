@@ -11,7 +11,8 @@ from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
-from reportlab.platypus import HRFlowable, Paragraph, SimpleDocTemplate, Spacer
+from reportlab.platypus import (HRFlowable, Paragraph, SimpleDocTemplate, Spacer, Table,
+                                TableStyle)
 
 FONT = "STSong-Light"
 _ready = False
@@ -48,7 +49,37 @@ def _styles() -> dict[str, ParagraphStyle]:
         "quote": mk("quote", fontSize=10, leading=16, textColor=SECOND, leftIndent=8),
         "body": mk("body"),
         "muted": mk("muted", textColor=MUTED),
+        # 表格单元格：字号略小、行距紧一点，长文本换行不溢出
+        "cell": mk("cell", fontSize=9, leading=12),
+        "cellhead": mk("cellhead", fontSize=9, leading=12, textColor=ACCENT),
     }
+
+
+_PIPE_ROW = re.compile(r"^\|.*\|$")
+_PIPE_SEP = re.compile(r"^\|[\s:\-|]+\|$")
+
+
+def _split_pipe(line: str) -> list[str]:
+    body = line.strip().strip("|")
+    return [c.strip() for c in body.split("|")]
+
+
+def _table(rows: list[list[str]], avail: float, st: dict) -> Table:
+    """把管道表格行变成真实表格：等宽列 + 细网格 + 表头浅底，单元格自动换行。"""
+    width = avail / max(1, len(rows[0]))
+    data = [[Paragraph(_esc(c) or " ", st["cellhead" if r == 0 else "cell"])
+             for c in row] for r, row in enumerate(rows)]
+    t = Table(data, colWidths=[width] * len(rows[0]), repeatRows=1, hAlign="LEFT")
+    t.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -1), 0.4, RULE),
+        ("BACKGROUND", (0, 0), (-1, 0), HexColor("#eef3fb")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+    ]))
+    return t
 
 
 def markdown_to_pdf(markdown: str, *, title: str = "", order_id: str = "", customer: str = "") -> bytes:
@@ -60,11 +91,30 @@ def markdown_to_pdf(markdown: str, *, title: str = "", order_id: str = "", custo
                             topMargin=16 * mm, bottomMargin=16 * mm,
                             title=title or "交付物", author="TripCraft · 旅鸢",
                             subject=f"{title} {order_id} {customer}".strip())
+    avail = doc.width
     story: list = []
-    for raw in (markdown or "").splitlines():
-        s = raw.strip()
+    lines = (markdown or "").splitlines()
+    i = 0
+    while i < len(lines):
+        s = lines[i].strip()
         if not s:
             story.append(Spacer(1, 2))
+            i += 1
+            continue
+        # 管道表格：连续 |...| 行 → 真表格（第一行表头；紧跟的 |---| 分隔行丢弃）
+        if _PIPE_ROW.match(s):
+            block: list[list[str]] = []
+            while i < len(lines) and _PIPE_ROW.match(lines[i].strip()):
+                row = _split_pipe(lines[i])
+                if not _PIPE_SEP.match(lines[i].strip()):
+                    block.append(row)
+                i += 1
+            if block:
+                cols = max(len(r) for r in block)
+                block = [r + [""] * (cols - len(r)) for r in block]
+                story.append(Spacer(1, 3))
+                story.append(_table(block, avail, st))
+                story.append(Spacer(1, 5))
             continue
         if s.startswith("### "):
             story.append(Paragraph(_esc(s[4:]), st["h2"]))
@@ -79,5 +129,6 @@ def markdown_to_pdf(markdown: str, *, title: str = "", order_id: str = "", custo
         else:
             text = _esc(re.sub(r"\*\*(.+?)\*\*", r"\1", s))
             story.append(Paragraph(text, st["muted"] if s.startswith("（未填写）") else st["body"]))
+        i += 1
     doc.build(story)
     return buf.getvalue()

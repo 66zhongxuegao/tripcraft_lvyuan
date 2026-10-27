@@ -5,6 +5,8 @@ import tempfile
 from datetime import datetime, timedelta
 from uuid import uuid4
 
+import pytest
+
 from tripcraft.services import dispatch_service as dispatch
 from tripcraft.services.practice_service import PracticeService
 from tripcraft.storage import Store
@@ -73,6 +75,18 @@ def test_first_call_after_limit_is_marked_missed():
                            {"dispatch_at": base.isoformat(), "grabbed_at": grab.isoformat()},
                            grabbed=True, now=grab + timedelta(minutes=90))
     assert info["first_call"]["missed"] is True
+
+
+@pytest.mark.parametrize("call_minutes,missed", [(30, False), (60, False), (90, True)])
+def test_completed_first_call_preserves_actual_timeliness(call_minutes, missed):
+    grab = datetime(2026, 10, 8, 9, 0, 0)
+    info = dispatch.status(
+        ORDER, grab.isoformat(), {"grabbed_at": grab.isoformat()}, grabbed=True,
+        first_call_at=(grab + timedelta(minutes=call_minutes)).isoformat(),
+        now=grab + timedelta(hours=5),
+    )
+    assert info["first_call"]["done"] is True
+    assert info["first_call"]["missed"] is missed
 
 
 # ---------------- 服务层：惰性判负与抢单守卫 ----------------

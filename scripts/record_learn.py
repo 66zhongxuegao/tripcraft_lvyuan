@@ -6,7 +6,7 @@
 
 用法：
     python -X utf8 scripts/record_learn.py
-    python -X utf8 scripts/record_learn.py --base http://127.0.0.1:5180
+    python -X utf8 scripts/record_learn.py --base http://127.0.0.1:5190
 """
 
 from __future__ import annotations
@@ -109,7 +109,7 @@ def tap(page, texts, wait=1.4, tags=TAGS, label=""):
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--base", default="http://127.0.0.1:5180")
+    ap.add_argument("--base", default="http://127.0.0.1:5190")
     ap.add_argument("--keep-frames", action="store_true")
     args = ap.parse_args()
 

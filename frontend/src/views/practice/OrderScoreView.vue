@@ -42,18 +42,12 @@
       </div>
       <div class="cv-bar"><i :style="{ width: Math.round(coverage.ratio * 100) + '%' }" /></div>
       <div class="cv-right">
-        <span class="cv-state" :class="coverage.passed ? 'ok' : 'bad'">
-          {{ coverage.passed ? '达到门槛，本次可写画像' : `低于 ${Math.round(coverage.threshold * 100)}% 门槛，本次不写画像` }}
-        </span>
+        <span class="cv-state">覆盖率供复盘参考，不影响画像展示</span>
         <button class="lnk" @click="showGaps = !showGaps">{{ showGaps ? '收起未覆盖项' : '查看未覆盖项' }}</button>
       </div>
       <div v-if="staleCount" class="cv-stale">
         有 {{ staleCount }} 个点本单已经考到、但还没评出分（评分要手动触发）。
         点右上角「{{ summary?.average == null ? '生成本单评分' : '重新评分' }}」补评一次即可。
-      </div>
-      <div class="cv-note">
-        一单只按画像抽 {{ coverage.targets }} 个技能点考核（61 个点里挑），没抽到的点本轮不评——
-        没有素材就评只能是幻觉。下面按维度列出的四类状态：已评估 / 已覆盖未评出 / 未覆盖 / 本单未考。
       </div>
       <div v-if="showGaps" class="cv-gaps">
         <div v-for="g in uncovered" :key="g.skill_point_id" class="gap">
@@ -68,21 +62,17 @@
       </div>
     </div>
 
-    <div v-if="cal" class="card cal" :class="cal.gate?.passed ? 'ok' : 'warn'">
-      <span class="cal-tag">校准基线</span>
-      <template v-if="cal.gate?.passed">
-        <span class="cal-txt">评分 Agent 已通过校准（一致率 {{ pct(cal.gate.agreement) }}／证据准确率 {{ pct(cal.gate.evidence_accuracy) }}，样本 {{ cal.gate.samples }} 条）</span>
-      </template>
-      <template v-else-if="cal.gate?.baseline">
-        <span class="cal-txt">未达标（{{ pct(cal.gate.agreement) }}）→ 本次按降权写入：只下调、不上调</span>
-      </template>
-      <template v-else>
-        <span class="cal-txt">无校准基线 → 评分 Agent 未经校准集验证，本次不写画像</span>
-      </template>
-      <span class="cal-th">阈值：置信 ≥ {{ cal.thresholds?.confidence }} / 边界 ±{{ cal.thresholds?.boundary_delta }}（{{ cal.thresholds?.source }}）</span>
+    <!-- 加载失败必须可见：以前整页在 catch 里被清空，学员看到的是空白而不是「加载失败」 -->
+    <div v-if="loadErrors.length" class="card notice bad">
+      数据没有全部加载成功：{{ loadErrors.map((e) => e.section).join('、') }} 失败（{{ loadErrors[0].detail }}）。
+      其余内容按已成功加载的部分显示，请刷新或稍后重试。
     </div>
 
     <div v-if="notice" class="card notice" :class="notice.kind">{{ notice.text }}</div>
+
+    <div v-if="reviewsFailed" class="card notice warn">
+      待复核列表没有加载成功：下面看不到待复核项**不代表没有待复核**，请刷新重试。
+    </div>
 
     <div v-if="reviews.length" class="card reviews">
       <div class="rv-head">
@@ -142,6 +132,88 @@
         </transition>
       </div>
     </div>
+
+    <transition name="sm-fade">
+      <div v-if="resultOpen" class="sm-overlay" @click.self="closeResult">
+        <div class="sm-dialog" role="dialog" aria-modal="true" aria-labelledby="sm-title">
+          <div class="sm-head">
+            <div>
+              <span class="sm-kicker">本单复盘 · 评分完成</span>
+              <h2 id="sm-title">评分结果与下一单难度</h2>
+              <p>{{ summary?.customer }} · {{ summary?.destination }} · {{ orderId }}</p>
+            </div>
+            <button type="button" class="sm-x" aria-label="关闭" @click="closeResult">×</button>
+          </div>
+
+          <div class="sm-stats">
+            <div><b>{{ result?.average ?? '—' }}</b><span>本单平均分</span></div>
+            <div><b>{{ result?.scored ?? 0 }}</b><span>评出技能点</span></div>
+            <div><b>{{ result?.profile_impact?.written ?? result?.written ?? 0 }}</b><span>写回画像</span></div>
+            <div><b>{{ result?.escalated?.length ?? 0 }}</b><span>待复核</span></div>
+          </div>
+
+          <section v-if="result?.profile_impact" class="sm-block">
+            <div class="sm-block-head">
+              <h3>对画像的影响</h3>
+              <span v-if="result.profile_impact.average_after != null">
+                已写回点均分 {{ result.profile_impact.average_before ?? '—' }} → {{ result.profile_impact.average_after }}
+              </span>
+            </div>
+            <div v-if="result.profile_auto_updated" class="sm-ok">画像已自动更新并保存快照</div>
+            <div v-else class="sm-warn">本次没有正式写回画像；待复核项采纳后才会改变能力值</div>
+            <div v-if="result.profile_impact.items?.length" class="sm-impact-list">
+              <div v-for="it in result.profile_impact.items" :key="it.skill_point_id" class="sm-impact-row">
+                <span class="sm-id">{{ it.skill_point_id }}</span>
+                <span class="sm-name">{{ it.name }}<i>{{ it.before_level }} → {{ it.after_level }}</i></span>
+                <span class="sm-score">{{ it.score ?? '—' }}<i>{{ it.level || '' }}</i></span>
+                <span class="sm-ba">{{ it.before ?? '—' }} → <b>{{ it.after ?? '—' }}</b></span>
+                <span class="sm-delta" :class="{ up: (it.delta || 0) > 0, down: (it.delta || 0) < 0 }">{{ deltaText(it) }}</span>
+                <span class="sm-status" :class="{ ok: it.written }">{{ it.written ? '已写回' : '待复核' }}</span>
+              </div>
+            </div>
+          </section>
+
+          <section v-if="result?.next_order" class="sm-block next">
+            <div class="sm-block-head">
+              <h3>下一单难度</h3>
+              <span>评分写回后自动重算</span>
+            </div>
+            <div class="sm-diff">
+              <span class="sm-current">{{ result.current_order?.difficulty || '本单' }}</span>
+              <span class="sm-arrow">→</span>
+              <span class="sm-next">{{ result.next_order.label }}</span>
+            </div>
+            <p v-if="result.next_order.branch === '补救'" class="sm-explain">
+              下一单的 3 个主考点里仍有低于 60 分的项，系统先走补救分支；本单已经写回的高分不会回退。
+            </p>
+            <div class="sm-targets">
+              <span v-for="(id, i) in result.next_order.target_skill_points" :key="id" class="sm-target">
+                {{ id }} · {{ result.next_order.target_names?.[i] || '' }}
+              </span>
+            </div>
+            <div class="sm-knobs">
+              <div v-for="(v, k) in result.next_order.knobs" :key="k" class="sm-knob">
+                <span>{{ result.next_order.knob_labels?.[k] || k }}</span>
+                <i><b :style="{ width: `${Math.max(0, Math.min(4, Number(v))) * 25}%` }" /></i>
+                <em>{{ result.next_order.knob_words?.[k] || v }}</em>
+              </div>
+            </div>
+            <p class="sm-rationale">{{ result.next_order.rationale }}</p>
+            <div class="sm-plan">
+              <span>首呼 {{ result.next_order.plan?.first_call_limit_min ?? '—' }} 分钟</span>
+              <span v-if="result.next_order.carried_over?.length">补考 {{ result.next_order.carried_over.join('、') }}</span>
+            </div>
+            <p v-if="result.next_order_error" class="sm-warn">{{ result.next_order_error }}</p>
+          </section>
+
+          <div class="sm-actions">
+            <button type="button" class="tc-btn ghost" @click="closeResult">留在本页</button>
+            <button type="button" class="tc-btn ghost" @click="goProfile">查看画像</button>
+            <button type="button" class="tc-btn" @click="goMessages">去生成下一单</button>
+          </div>
+        </div>
+      </div>
+    </transition>
   </div>
 </template>
 
@@ -159,13 +231,17 @@ const gates = ref<any>({ done: 0, total: 0 })
 const evidence = ref<any[]>([])
 const coverage = ref<any>(null)
 const reviews = ref<any[]>([])
-const cal = ref<any>(null)
 const dims = ref<any[]>([])
 const openId = ref('C1')
 const openEvidence = ref('')
 const showGaps = ref(false)
 const running = ref(false)
 const notice = ref<{ kind: string; text: string } | null>(null)
+const resultOpen = ref(false)
+const result = ref<any>(null)
+/** 加载失败必须可见：不允许某一项请求失败就把整页静默清空（历史缺陷）。 */
+const loadErrors = ref<{ key: string; section: string; detail: string }[]>([])
+const reviewsFailed = computed(() => loadErrors.value.some((e) => e.key === 'reviews'))
 
 const COLORS: Record<string, string> = {
   C1: '#2577e3', C2: '#12a76a', C3: '#7a5af8', C4: '#e08a1e',
@@ -211,30 +287,68 @@ const dimsView = computed<any[]>(() => (dims.value || []).map((d: any) => {
 }))
 
 async function load() {
-  try {
-    const [s, g, e, c, r, cl] = await Promise.all([
-      client.get(`/practice/orders/${orderId.value}/scores`),
-      client.get(`/practice/orders/${orderId.value}/gates`),
-      client.get(`/practice/orders/${orderId.value}/evidence`),
-      client.get(`/practice/orders/${orderId.value}/coverage`),
-      client.get(`/practice/orders/${orderId.value}/reviews`),
-      client.get('/calibration'),
-    ])
-    cal.value = cl.data
-    summary.value = s.data
-    gates.value = g.data
-    evidence.value = e.data
-    coverage.value = c.data
-    reviews.value = r.data
+  // 只请求**学员可用**的端点。绝不请求 /calibration：那是平台调试面（管理员专属），
+  // 学员账号会拿到 404；历史上它放在同一个 Promise.all 里，导致 404 让整页数据全部落空。
+  const reqs = [
+    { key: 'scores', section: '评分明细', url: `/practice/orders/${orderId.value}/scores` },
+    { key: 'gates', section: '阶段通关', url: `/practice/orders/${orderId.value}/gates` },
+    { key: 'evidence', section: '证据链', url: `/practice/orders/${orderId.value}/evidence` },
+    { key: 'coverage', section: '覆盖度', url: `/practice/orders/${orderId.value}/coverage` },
+    { key: 'reviews', section: '待复核', url: `/practice/orders/${orderId.value}/reviews` },
+  ]
+  // 各项**独立**结算：一项失败不影响其余各项，且失败必须可见。
+  const results = await Promise.allSettled(reqs.map((r) => client.get(r.url)))
+  const data: Record<string, any> = {}
+  const errors: { key: string; section: string; detail: string }[] = []
+  results.forEach((res, i) => {
+    const req = reqs[i]
+    if (res.status === 'fulfilled') { data[req.key] = res.value.data; return }
+    const resp = (res.reason as any)?.response
+    const detail = resp?.data?.detail || (res.reason as any)?.message || '未知错误'
+    errors.push({ key: req.key, section: req.section, detail: resp?.status ? `HTTP ${resp.status} · ${detail}` : detail })
+  })
+  loadErrors.value = errors
+
+  if ('gates' in data) gates.value = data.gates
+  if ('evidence' in data) evidence.value = data.evidence || []
+  if ('coverage' in data) coverage.value = data.coverage
+  if ('reviews' in data) reviews.value = data.reviews || []
+  if ('scores' in data) {
+    summary.value = data.scores
+    const dimsRaw = data.scores.dimensions || []
     // 待复核的点也显示出来
-    for (const d of s.data.dimensions) {
-      for (const p of d.points) {
-        const rv = r.data.find((x: any) => x.skill_point_id === p.id)
+    for (const d of dimsRaw) {
+      for (const p of d.points || []) {
+        const rv = (reviews.value || []).find((x: any) => x.skill_point_id === p.id)
         if (rv) { p.pending = true; p.score = rv.score; p.level = rv.level }
       }
     }
-    dims.value = s.data.dimensions
-  } catch { dims.value = [] }
+    dims.value = dimsRaw
+  }
+}
+
+function openResult(r: any) {
+  result.value = r
+  resultOpen.value = true
+}
+
+function closeResult() {
+  resultOpen.value = false
+}
+
+function deltaText(it: any) {
+  if (it.delta == null) return '—'
+  return it.delta > 0 ? `+${it.delta}` : String(it.delta)
+}
+
+function goProfile() {
+  closeResult()
+  router.push('/profile')
+}
+
+function goMessages() {
+  closeResult()
+  router.push('/practice/messages')
 }
 
 async function runScore() {
@@ -242,12 +356,15 @@ async function runScore() {
   notice.value = { kind: 'info', text: '评分 Agent 正在对照 Rubric 逐点判定，每条判定都要引用证据，请稍候…' }
   try {
     const r = (await client.post(`/practice/orders/${orderId.value}/score`)).data
+    openResult(r)
     const bits = [`本单评出 ${r.scored} 个技能点（平均 ${r.average ?? '—'}）`]
     if (r.dropped?.length) bits.push(`${r.dropped.length} 个因拿不到证据未给分`)
     if (r.escalated?.length) bits.push(`${r.escalated.length} 个转人工复核`)
     if (r.written) bits.push(`已写回画像 ${r.written} 项`)
-    if (r.deferred) bits.push('覆盖度不足，本次未写画像')
-    notice.value = { kind: r.deferred || r.escalated?.length ? 'warn' : 'ok', text: bits.join('；') + '。' }
+    if (r.profile_auto_updated) bits.push('画像已自动更新')
+    if (r.deferred) bits.push('本次评分待校准，尚未确认的维度沿用初始画像')
+    if (r.profile_refresh_error) bits.push(`画像自动更新未完成：${r.profile_refresh_error}`)
+    notice.value = { kind: r.deferred || r.escalated?.length || r.profile_refresh_error ? 'warn' : 'ok', text: bits.join('；') + '。' }
     await load()
   } catch (e: any) {
     notice.value = { kind: 'bad', text: e?.response?.data?.detail || '评分失败，请稍后重试' }
@@ -265,7 +382,6 @@ async function resolve(r: any, decision: string) {
   }
 }
 
-function pct(v: number | undefined) { return v === undefined ? '—' : Math.round(v * 100) + '%' }
 function toggleEvidence(id: string) { openEvidence.value = openEvidence.value === id ? '' : id }
 function review(id: string) { router.push(`/learn/thread/${id}`) }
 
@@ -296,6 +412,8 @@ watch(orderId, () => {
   dims.value = []
   reviews.value = []
   notice.value = null
+  resultOpen.value = false
+  result.value = null
   load()
 })
 </script>
@@ -333,7 +451,7 @@ watch(orderId, () => {
 .st-ev.muted { color: $color-text-muted; }
 .ev-chip { font-size: 15.5px; background: $color-primary-softer; color: $color-text-secondary; border-radius: 999px; padding: 3px 11px; }
 
-.cover { display: grid; grid-template-columns: 260px 1fr; grid-template-areas: "left bar" "gaps gaps"; align-items: center; gap: 10px 16px; padding: 13px 18px; border-left: 4px solid #e04b4b; }
+.cover { display: grid; grid-template-columns: 260px 1fr; grid-template-areas: "left bar" "gaps gaps"; align-items: center; gap: 10px 16px; padding: 13px 18px; border-left: 4px solid $color-primary; }
 .cover.pass { border-left-color: #12a76a; }
 .cv-left { grid-area: left; display: flex; align-items: baseline; gap: 10px; }
 .cv-title { font-size: 15px; font-weight: 700; }
@@ -344,12 +462,10 @@ watch(orderId, () => {
 .cv-bar i { display: block; height: 100%; background: linear-gradient(90deg, #2577e3, #4f9bf5); }
 .cover.pass .cv-bar i { background: linear-gradient(90deg, #12a76a, #35c084); }
 .cv-right { grid-column: 1 / -1; display: flex; align-items: center; gap: 12px; }
-.cv-state { font-size: 15.5px; }
+.cv-state { font-size: 15.5px; color: $color-text-secondary; }
 .cv-state.ok { color: #0d8a55; }
 .cv-stale { grid-column: 1 / -1; font-size: 14.5px; line-height: 1.7; color: #a35b00; margin-top: 8px;
   background: #fff8ec; border: 1px solid #f4e3c2; border-radius: 8px; padding: 8px 11px; }
-.cv-note { grid-column: 1 / -1; font-size: 14px; line-height: 1.8; color: $color-text-secondary; margin-top: 8px;
-  background: #f4f8fd; border: 1px solid #e6eefa; border-radius: 8px; padding: 9px 12px; }
 .cv-state.bad { color: #c0392b; }
 .cv-gaps { grid-area: gaps; border-top: 1px dashed #eef1f5; padding-top: 8px; display: flex; flex-direction: column; gap: 4px; }
 .gap { display: flex; align-items: center; gap: 10px; font-size: 15.5px; padding: 4px 0; }
@@ -358,13 +474,6 @@ watch(orderId, () => {
 .gap-name { font-weight: 600; }
 .gap-kind { font-size: 14.5px; background: #eef1f5; border-radius: 4px; padding: 1px 6px; color: $color-text-secondary; }
 .gap-reason { color: $color-text-secondary; }
-
-.cal { display: flex; align-items: center; gap: 12px; padding: 10px 16px; font-size: 15.5px; flex-wrap: wrap; }
-.cal.ok { background: #f2fbf5; border-color: #cdeada; }
-.cal.warn { background: #fffaf0; border-color: #f3e0bd; }
-.cal-tag { font-size: 14.5px; border-radius: 4px; padding: 1px 7px; background: $color-primary-soft; color: $color-primary; }
-.cal-txt { flex: 1; color: $color-text-secondary; }
-.cal-th { color: $color-text-muted; font-size: 15px; }
 
 .notice { padding: 11px 16px; font-size: 15.5px; line-height: 1.7; }
 .notice.info { background: $color-primary-softer; color: $color-text-secondary; }
@@ -419,4 +528,75 @@ watch(orderId, () => {
 .lnk { border: none; background: none; color: $color-primary; font-size: 15.5px; cursor: pointer; padding: 0; }
 .fold-enter-active, .fold-leave-active { transition: opacity .18s ease; }
 .fold-enter-from, .fold-leave-to { opacity: 0; }
+
+.sm-overlay {
+  position: fixed; inset: 0; z-index: 1200; padding: 24px;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(15, 23, 42, .56); backdrop-filter: blur(4px);
+}
+.sm-dialog {
+  width: min(780px, 100%); max-height: min(88vh, 920px); overflow: auto;
+  background: #fff; border-radius: 18px; padding: 24px 26px;
+  box-shadow: 0 24px 80px rgba(15, 23, 42, .3);
+}
+.sm-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.sm-kicker { font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: $color-primary; font-weight: 700; }
+.sm-head h2 { margin: 5px 0 4px; font-size: 26px; letter-spacing: -.02em; }
+.sm-head p { margin: 0; font-size: 14px; color: $color-text-muted; }
+.sm-x { width: 32px; height: 32px; border: 0; border-radius: 50%; background: #f1f5f9; color: #64748b; font-size: 21px; line-height: 1; cursor: pointer; }
+.sm-x:hover { background: #e2e8f0; }
+.sm-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin: 18px 0 4px; }
+.sm-stats > div { padding: 12px 14px; border: 1px solid #e2e8f0; border-radius: 12px; background: #f8fafc; }
+.sm-stats b { display: block; font-size: 24px; color: #0f172a; line-height: 1.2; }
+.sm-stats span { display: block; margin-top: 3px; font-size: 12px; color: $color-text-muted; }
+.sm-block { margin-top: 16px; padding-top: 16px; border-top: 1px solid #eef2f7; }
+.sm-block-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.sm-block-head h3 { margin: 0; font-size: 17px; }
+.sm-block-head span { font-size: 13px; color: $color-text-muted; }
+.sm-ok, .sm-warn { margin: 8px 0; padding: 8px 10px; border-radius: 8px; font-size: 13px; line-height: 1.6; }
+.sm-ok { background: #ecfdf5; color: #047857; }
+.sm-warn { background: #fff7ed; color: #b45309; }
+.sm-impact-list { max-height: 220px; overflow: auto; margin-top: 8px; }
+.sm-impact-row {
+  display: grid; grid-template-columns: 52px minmax(0, 1fr) 54px 92px 48px 58px;
+  align-items: center; gap: 8px; padding: 8px 0; border-bottom: 1px dashed #eef2f7; font-size: 14px;
+}
+.sm-impact-row:last-child { border-bottom: 0; }
+.sm-id { font-family: ui-monospace, monospace; color: $color-text-muted; }
+.sm-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sm-name i, .sm-score i { display: block; margin-top: 2px; font-style: normal; font-size: 11px; color: #94a3b8; }
+.sm-score { text-align: right; font-weight: 700; }
+.sm-ba { text-align: right; color: $color-text-muted; white-space: nowrap; }
+.sm-ba b { color: #0f172a; }
+.sm-delta { text-align: right; font-weight: 800; color: $color-text-muted; }
+.sm-delta.up { color: #059669; }
+.sm-delta.down { color: #dc2626; }
+.sm-status { padding: 2px 6px; border-radius: 999px; font-size: 11px; text-align: center; background: #fff7ed; color: #b45309; white-space: nowrap; }
+.sm-status.ok { background: #ecfdf5; color: #047857; }
+.sm-diff { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 10px 0 12px; }
+.sm-explain { margin: -2px 0 10px; padding: 8px 10px; border-radius: 8px; background: #eff6ff; color: #1d4ed8; font-size: 13px; line-height: 1.6; }
+.sm-current, .sm-next { padding: 6px 12px; border-radius: 999px; font-weight: 700; }
+.sm-current { background: #f1f5f9; color: #475569; }
+.sm-next { background: #fff7ed; color: #c2410c; }
+.sm-arrow { color: #94a3b8; font-weight: 700; }
+.sm-targets { display: flex; flex-wrap: wrap; gap: 6px; }
+.sm-target { padding: 4px 9px; border-radius: 999px; background: #eff6ff; color: #1d4ed8; font-size: 13px; }
+.sm-knobs { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 18px; margin: 14px 0; }
+.sm-knob { display: grid; grid-template-columns: 94px 1fr 62px; align-items: center; gap: 8px; font-size: 13px; }
+.sm-knob > span { color: #475569; }
+.sm-knob i { display: block; height: 7px; overflow: hidden; border-radius: 999px; background: #eef2f7; }
+.sm-knob i b { display: block; height: 100%; border-radius: 999px; background: linear-gradient(90deg, #2577e3, #4f9bf5); }
+.sm-knob em { font-style: normal; text-align: right; font-size: 11px; color: $color-text-muted; }
+.sm-rationale { margin: 12px 0; padding: 9px 11px; border-left: 3px solid $color-primary; border-radius: 6px; background: #f8fafc; color: #475569; font-size: 14px; line-height: 1.7; }
+.sm-plan { display: flex; gap: 10px; flex-wrap: wrap; font-size: 13px; color: $color-text-muted; }
+.sm-actions { display: flex; justify-content: flex-end; gap: 10px; flex-wrap: wrap; margin-top: 20px; }
+.sm-fade-enter-active, .sm-fade-leave-active { transition: opacity .2s ease; }
+.sm-fade-enter-from, .sm-fade-leave-to { opacity: 0; }
+@media (max-width: 640px) {
+  .sm-overlay { padding: 12px; }
+  .sm-dialog { padding: 20px 18px; }
+  .sm-stats { grid-template-columns: 1fr 1fr; }
+  .sm-impact-row { grid-template-columns: 48px minmax(0, 1fr) 48px 80px 42px 52px; gap: 6px; font-size: 13px; }
+  .sm-knobs { grid-template-columns: 1fr; }
+}
 </style>

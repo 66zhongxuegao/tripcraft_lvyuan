@@ -21,7 +21,7 @@ from playwright.sync_api import sync_playwright
 ROOT = Path(__file__).resolve().parents[1]
 FRAMES = ROOT / "output" / "demo-frames"
 FFMPEG = r"C:\ffmpeg\bin\ffmpeg.exe"
-BASE = "http://127.0.0.1:5180"
+BASE = "http://127.0.0.1:5190"
 
 VIEWPORT = {"width": 1280, "height": 760}
 FPS = 6                     # 采集帧率（截图本身约 100ms/张，6fps 够用）

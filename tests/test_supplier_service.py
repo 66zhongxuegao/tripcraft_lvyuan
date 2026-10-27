@@ -4,6 +4,7 @@
 且**事件与事实必须同源**——群里说了酒店超售，酒店群里再问也必须是超售口径。
 """
 
+import json
 import os
 import tempfile
 from uuid import uuid4
@@ -12,7 +13,8 @@ import pytest
 
 from tripcraft.services.director_service import DirectorService
 from tripcraft.services.practice_service import PracticeService
-from tripcraft.services.supplier_service import SupplierService, _party
+from tripcraft.services.supplier_service import (SupplierService, _party,
+                                                    destination_city, persist_destination_city)
 from tripcraft.storage import Store
 
 O1 = "9000000000000001"          # 江苏 · 阶段 1
@@ -36,7 +38,15 @@ def group(svc, order_id, code):
 
 
 def unlock(svc, practice, order_id, *kinds):
-    """新规则：没加联系人的群不能发言。测试里先把联系人加上。"""
+    """把测试需要的资源联系人准备好；城市级资源先由地接确认资源池。"""
+    resource_kinds = [k for k in kinds if k in ("酒店", "车队", "导游", "司机")]
+    if resource_kinds and "地接社" not in svc.added_contacts(order_id):
+        svc.add_contact(order_id, "地接社")
+    if resource_kinds:
+        director = DirectorService(store=svc._store, practice=practice)
+        row = svc._store.order(order_id)
+        director.materialize_resource_pool(order_id, "测试资源询价", resource_kinds,
+                                            destination_city(row), "")
     for kind in kinds:
         svc.add_contact(order_id, kind)
 
@@ -47,10 +57,7 @@ def test_hub_is_one_per_user_and_dms_are_per_person():
     hub = svc.ensure_hub("u-demo")
     assert hub["session_id"] == svc.hub_id("u-demo")
     assert svc.ensure_hub("u-demo")["session_id"] == hub["session_id"]     # 幂等、全局唯一
-    # 没加任何人之前：这一单的会话里只有资源大群
-    assert [g["code"] for g in svc.ensure_groups(O1)] == ["hub"]
-    # 加了地接 → 大群成员里出现他，且生出他的单聊
-    unlock(svc, practice, O1, "地接社")
+    # 接单后平台自动指派地接：本单资源群和地接单聊同时出现
     groups = {g["code"]: g for g in svc.ensure_groups(O1)}
     assert "dm-地接社" in groups and svc.names(O1)["地接社"] in groups["hub"]["members"]
     # 同一学员的两个订单：客户是两个人，各有各的单聊，不会串
@@ -59,17 +66,21 @@ def test_hub_is_one_per_user_and_dms_are_per_person():
     assert svc.contact_dm("u-demo", "客户", O1) != svc.contact_dm("u-demo", "客户", O2)
 
 
-def test_stage_gate_defers_before_the_step():
-    """阶段门控还在：订单没走到询价那一步，酒店单聊里也是"现在说不好"。"""
+def test_contact_gate_requires_requirement_before_resource_contacts():
+    """首呼后只给客户；需求确认单提交后才开放地接与后续资源。"""
     store, practice, svc, _ = make()
+    with pytest.raises(ValueError):
+        svc.add_contact(O6, "客户")
     practice.record_action(O6, "grab")
     practice.record_action(O6, "first_call")
-    unlock(svc, practice, O6, "地接社", "酒店")
-    hotel_sid = svc.contact_dm("u-demo", "酒店", O6)
-    assert hotel_sid
-    out = svc.respond(hotel_sid, "这三天四星房什么价？")
-    assert out["deferred"] is True and out["sender"] == svc.names(O6)["酒店"]
-    assert "说不好" in out["content"]
+    cat = {c["kind"]: c for c in svc.contact_catalog(O6)}
+    assert cat["客户"]["available"] is True
+    assert cat["地接社"]["available"] is False
+    with pytest.raises(ValueError):
+        svc.add_contact(O6, "地接社")
+    practice.record_action(O6, "deliverable:需求确认单")
+    cat = {c["kind"]: c for c in svc.contact_catalog(O6)}
+    assert cat["地接社"]["available"] is True
 
 
 def test_quote_is_order_specific_and_persisted():
@@ -149,29 +160,25 @@ def test_customer_group_replies_in_character():
     unlock(svc, practice, O1, "客户")
     cus = svc.group_for(O1, "customer")
     out = svc.respond(cus["session_id"], "您好，我是您的定制师，方案今晚发您。")
-    assert out["sender"] == "客户" and out["content"] and not out.get("locked")
+    assert out["sender"] == svc.names(O1)["客户"] and out["content"] and not out.get("locked")
     assert "教练" not in out["content"]
 
 
 def test_contacts_follow_the_real_sequence():
-    """联系人不是一上来全给：先首呼才有客户，接单才有地接，酒店车队由地接给，司导要等行前。"""
+    """接单→首呼只给客户；需求确认→地接；地接→酒店/车队；行前才给司导。"""
     store, practice, svc, _ = make()
-    cat = {c["kind"]: c for c in svc.contact_catalog(O6)}
-    assert cat["地接社"]["available"] is False and cat["客户"]["available"] is False
-    with pytest.raises(ValueError):
-        svc.add_contact(O6, "酒店")
     practice.record_action(O6, "grab")
-    cat = {c["kind"]: c for c in svc.contact_catalog(O6)}
-    assert cat["地接社"]["available"] is True and cat["客户"]["available"] is False
+    assert svc.contact_catalog(O6)[1]["available"] is False
     practice.record_action(O6, "first_call")
-    svc.add_contact(O6, "地接社")
-    cat = {c["kind"]: c for c in svc.contact_catalog(O6)}
-    assert cat["客户"]["available"] is True and cat["酒店"]["available"] is True
-    assert cat["导游"]["available"] is False          # 还没到行前
     svc.add_contact(O6, "客户")
     assert "客户" in svc.added_contacts(O6)
-    dms = [s for s in store.sessions("u-demo", O6) if s["code"].startswith("dm-")]
-    assert len(dms) == 2                              # 每个联系人一个 1:1 会话
+    practice.record_action(O6, "deliverable:需求确认单")
+    svc.add_contact(O6, "地接社")
+    cat = {c["kind"]: c for c in svc.contact_catalog(O6)}
+    assert cat["酒店"]["available"] is False and cat["车队"]["available"] is False
+    svc.respond(svc.ensure_hub("u-demo", O6)["session_id"], "大连要酒店和车队")
+    cat = {c["kind"]: c for c in svc.contact_catalog(O6)}
+    assert cat["酒店"]["available"] is True and cat["车队"]["available"] is True
 
 
 def test_group_rename_and_invite():
@@ -217,19 +224,164 @@ def test_defer_variants_differ():
     texts = {t.format(reason="需求还没确认完") for t in DEFER_VARIANTS}
     assert len(texts) == len(DEFER_VARIANTS) >= 3
 
-def test_defer_reply_alternates_and_has_no_prefix():
-    """连着追问时，资源方不能一字不差地重复上一句，正文也不该带（姓名）。"""
+def test_locked_contact_reports_the_missing_step():
+    """拿不到联系人时给出下一步，而不是让学员猜为什么不能加。"""
     store, practice, svc, _ = make()
     practice.record_action(O6, "grab")
     practice.record_action(O6, "first_call")
-    unlock(svc, practice, O6, "地接社", "酒店")
-    sid = svc.contact_dm("u-demo", "酒店", O6)      # O6 还在阶段 0，酒店不该报价
-    assert sid
-    first = svc.respond(sid, "这三天四星房什么价？")
-    assert first["deferred"] is True
-    assert not first["content"].startswith("（"), "正文里不该再带（姓名）前缀"
-    store.add_im_message(sid, first["sender"], "other", first["content"])
-    second = svc.respond(sid, "到底什么价，给个准数")
-    assert second["deferred"] is True
-    assert second["content"] != first["content"], "连问两次不能回一模一样的句子"
+    with pytest.raises(ValueError) as err:
+        svc.add_contact(O6, "地接社")
+    assert "需求确认单提交后" in str(err.value)
 
+
+
+def test_resource_hub_is_order_scoped_and_excludes_customer():
+    """资源对接群按订单创建，只含本单资源方；客户始终留在客户单聊/客户群。"""
+    store, practice, svc, _ = make()
+    unlock(svc, practice, O1, "客户", "地接社", "酒店")
+    unlock(svc, practice, O2, "地接社", "酒店")
+    hub1 = svc.ensure_hub("u-demo", O1)
+    hub2 = svc.ensure_hub("u-demo", O2)
+    assert hub1["session_id"] != hub2["session_id"]
+    assert hub1["order_id"] == O1 and hub2["order_id"] == O2
+    members1 = svc._members(store.session(hub1["session_id"]))
+    assert svc.names(O1)["客户"] not in members1
+    assert svc.names(O1)["地接社"] in members1
+    assert svc.names(O1)["酒店"] in members1
+    assert svc.names(O2)["地接社"] not in members1
+    assert svc.names(O2)["酒店"] not in members1
+
+
+def test_resource_hub_rejects_customer_invite():
+    store, practice, svc, _ = make()
+    unlock(svc, practice, O1, "客户", "地接社")
+    hub = svc.ensure_hub("u-demo", O1)
+    customer = svc.names(O1)["客户"]
+    out = svc.add_members(hub["session_id"], [customer])
+    assert out["blocked_customer"] == [customer]
+    assert customer not in svc._members(store.session(hub["session_id"]))
+
+
+def test_ensure_groups_uses_order_hub_without_customer_context():
+    store, practice, svc, _ = make()
+    unlock(svc, practice, O1, "客户", "地接社")
+    hub = next(g for g in svc.ensure_groups(O1) if g["code"] == "hub")
+    assert hub["session_id"] == svc.hub_id("u-demo", O1)
+    assert hub["customer"] == "" and hub["destination"] == ""
+
+
+def test_hub_dispatch_uses_only_real_members_and_keeps_context():
+    store, practice, svc, _ = make()
+    store.add_action(O1, "grab", {"test": True})
+    hub = svc.ensure_hub("u-demo", O1)
+    sid = hub["session_id"]
+    names = svc.names(O1)
+
+    # 接单后只自动带入平台指派的地接，酒店和司导不能凭空出现。
+    assert svc._members(store.session(sid)) == ["我", names["地接社"]]
+    first = svc.respond(sid, "酒店有没有四星房，什么价？")
+    assert first["sender"] == names["地接社"], "先由地接确认资源和城市"
+    assert "可添加列表" in first["content"]
+    assert names["酒店"] not in svc._members(store.session(sid))
+
+    store.add_im_message(sid, "我", "me", "酒店有没有四星房，什么价？")
+    store.add_im_message(sid, first["sender"], "other", first["content"])
+    follow = svc.respond(sid, "是大床房还是标间？")
+    assert follow["sender"] == names["酒店"], "地接确认后，酒店追问由本城酒店接续"
+
+    store.add_im_message(sid, "我", "me", "是大床房还是标间？")
+    store.add_im_message(sid, follow["sender"], "other", follow["content"])
+    guide = svc.respond(sid, "呼和浩特夫妻二人包车两天，需要司导")
+    assert guide["sender"] == names["地接社"], "司导档期由地接统筹，不凭空生成导游"
+    assert "排班" in guide["content"]
+
+    store.add_im_message(sid, "我", "me", "呼和浩特夫妻二人包车两天，需要司导")
+    store.add_im_message(sid, guide["sender"], "other", guide["content"])
+    customer = svc.respond(sid, "是客户N内蒙古")
+    assert customer["sender"] == "系统"
+    assert names["客户"] not in svc._members(store.session(sid))
+
+
+def test_resource_event_uses_actual_dmc_name():
+    store, practice, svc, director = make()
+    store.add_action(O1, "grab", {"test": True})
+    svc.ensure_hub("u-demo", O1)
+    speaker = director._speaker_name(store.order(O1), "XX地接·张经理")
+    assert speaker == svc.names(O1)["地接社"]
+
+
+def test_city_selection_controls_city_level_resources():
+    store, practice, svc, _ = make()
+    assert destination_city(store.order(O1)) == "南京"
+    persist_destination_city(store, O1, "苏州")
+    names = svc.names(O1)
+    assert "苏州" in names["酒店"]
+    assert "苏州导游" == names["导游"].split("·")[0]
+    assert svc.facts(O1, "酒店")["city"] == "苏州"
+
+
+def test_vehicle_and_ticket_questions_get_concrete_answers():
+    store, practice, svc, _ = make()
+    store.add_action(O1, "grab", {"test": True})
+    hub = svc.ensure_hub("u-demo", O1)
+    sid = hub["session_id"]
+    car = svc.respond(sid, "3大1小，5座车多少钱一天？")
+    assert "5座" in car["content"] and "/天" in car["content"]
+    assert "18:00" not in car["content"]
+    store.add_im_message(sid, "我", "me", "3大1小，5座车多少钱一天？")
+    store.add_im_message(sid, car["sender"], "other", car["content"])
+    ticket = svc.respond(sid, "门票多少钱")
+    assert "首道门票" in ticket["content"]
+    assert "18:00" not in ticket["content"]
+
+
+def test_dmc_reply_materializes_city_resource_pool():
+    store, practice, svc, _ = make()
+    hub = svc.ensure_hub("u-demo", O2)
+    out = svc.respond(hub["session_id"],
+                      "10月21日去大理，要四星酒店、7座车和司导，老人少走路")
+    assert out["sender"] == svc.names(O2)["地接社"]
+    assert "大理" in out["content"] and "联系人已放到可添加列表" in out["content"]
+    order = store.order(O2)
+    pool = json.loads(order["payload"]).get("resource_pool") or {}
+    assert pool["city"] == "大理"
+    assert {"酒店", "车队", "导游", "司机"}.issubset(set(pool["kinds"]))
+    cat = {c["kind"]: c for c in svc.contact_catalog(O2)}
+    assert cat["酒店"]["available"] and cat["车队"]["available"]
+    assert cat["导游"]["available"] and cat["司机"]["available"]
+    assert "大理" in cat["酒店"]["name"] and "大理" in cat["导游"]["name"]
+
+
+def test_ticket_office_is_fixed_window_for_public_transport_only():
+    store, practice, svc, _ = make()
+    ticket = svc.ensure_ticket_window("u-demo", O1)
+    sid = ticket["session_id"]
+    assert ticket["code"] == "ticket"
+    out = svc.respond(sid, "10月21日，从西安北站到兵马俑，坐高铁")
+    assert out["sender"] == "票务·陈"
+    assert "10月21日" in out["content"] and "西安北站" in out["content"]
+    assert "小时" in out["content"] and "元/人" in out["content"]
+    private = svc.respond(sid, "包车从西安北站到兵马俑")
+    assert "只负责公共交通" in private["content"]
+
+
+def test_hub_switches_to_any_named_city_before_contact_reply():
+    store, practice, svc, _ = make()
+    hub = svc.ensure_hub("u-demo", O1)
+    sid = hub["session_id"]
+    first = svc.respond(sid, "江苏酒店一晚多少钱")
+    assert first["sender"] == svc.names(O1)["地接社"]
+    import json
+    first_pool = json.loads((store.order(O1) or {}).get("payload") or "{}").get("resource_pool") or {}
+    assert first_pool["city"] == "南京", "省名不能被当成城市"
+    for city in ("宿迁", "无锡", "常州"):
+        store.add_im_message(sid, "我", "me", f"{city}的酒店一晚多少钱")
+        store.add_im_message(sid, first["sender"], "other", first["content"])
+        out = svc.respond(sid, f"{city}的酒店一晚多少钱")
+        assert out["sender"] == svc.names(O1)["地接社"]
+        assert city in out["content"]
+        assert "查不到" not in out["content"]
+        import json
+        pool = json.loads((store.order(O1) or {}).get("payload") or "{}").get("resource_pool") or {}
+        assert pool["city"] == city
+        first = out

@@ -1,4 +1,4 @@
-# TripCraft M0 冒烟自检：跑测试 + 打印契约摘要
+﻿# TripCraft M0 冒烟自检：跑测试 + 打印契约摘要
 $ErrorActionPreference = "Stop"
 $projRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $projRoot

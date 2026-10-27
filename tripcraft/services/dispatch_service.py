@@ -23,7 +23,7 @@ def _env() -> dict[str, int]:
     cfg = dict(DEFAULTS)
     p = ROOT / "local.env"
     if p.exists():
-        for line in p.read_text(encoding="utf-8").splitlines():
+        for line in p.read_text(encoding="utf-8-sig").splitlines():
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
                 k, v = line.split("=", 1)
@@ -116,7 +116,8 @@ def status(order_id: str, created_at: str | None, payload: dict,
             "due_at": fc_due.isoformat(timespec="seconds"),
             "done": bool(fc_done),
             "seconds_left": max(0, int((fc_due - now).total_seconds())),
-            "missed": bool(not fc_done and now > fc_due),
+            # 补做首呼后仍保留超时事实，不能因轮询时机不同而漏记时效考核。
+            "missed": (fc_done or now) > fc_due,
         }
         out["plan"] = {
             "limit_min": cfg["PLAN_LIMIT_MIN"],

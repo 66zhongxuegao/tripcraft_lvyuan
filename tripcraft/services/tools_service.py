@@ -8,6 +8,9 @@
 
 from __future__ import annotations
 
+import json
+import time
+
 from ..agents.llm import DeepSeekClient
 from ..contracts.rubric import RUBRICS
 from ..tools import external
@@ -166,28 +169,34 @@ class ToolsService:
     # ---------- ② 资源方 Agent ----------
 
     # 情景状态（导演控制）：控制资源方 Agent 的客观约束
-    def supplier_states(self) -> dict[str, dict]:
+    # user_id 必须由调用方（API 层 = 当前登录用户；场景域 = 案例账号）显式传入。
+    # 这里不再给 "u-demo" 默认值：要么拿到真实归属，要么明确失败，绝不退化成 demo 账号（R02/R07）。
+    def supplier_states(self, user_id: str) -> dict[str, dict]:
+        if not user_id:
+            raise ValueError("supplier_states 需要明确的 user_id（不接受空归属）")
         if self._store is not None:
-            return self._store.supplier_states("u-demo")
+            return self._store.supplier_states(user_id)
         return dict(self._states)
 
-    def set_supplier_state(self, kind: str, state: dict) -> dict:
+    def set_supplier_state(self, kind: str, state: dict, user_id: str) -> dict:
+        if not user_id:
+            raise ValueError("set_supplier_state 需要明确的 user_id（不接受空归属）")
         if kind not in SUPPLIER_ROLES:
             raise ValueError(f"未知资源方: {kind}")
         clean = {k: v for k, v in state.items() if k in STATE_LABELS and v not in (None, "")}
         if self._store is not None:
-            self._store.set_supplier_state("u-demo", kind, clean)
+            self._store.set_supplier_state(user_id, kind, clean)
         else:
             self._states[kind] = clean
         return clean
 
     # ---------- ② 资源方 Agent ----------
 
-    def supplier(self, kind: str, request: str) -> dict:
+    def supplier(self, kind: str, request: str, user_id: str) -> dict:
         role = SUPPLIER_ROLES.get(kind)
         if not role:
             raise ValueError(f"未知资源方: {kind}")
-        state = self.supplier_states().get(kind, {})
+        state = self.supplier_states(user_id).get(kind, {})
         data = self._require_llm().chat_json(
             [{"role": "system", "content": SUPPLIER_SYSTEM.format(role=role, state=render_state(state))},
              {"role": "user", "content": f"定制师的询价：{request}"}],
@@ -200,12 +209,29 @@ class ToolsService:
 
     # ---------- ③ 交付物投递（客户读取） ----------
 
-    def deliverable_feedback(self, kind: str, content: str, customer: str = "客户") -> dict:
-        data = self._require_llm().chat_json(
-            [{"role": "system", "content": CUSTOMER_SYSTEM},
-             {"role": "user", "content": f"我是{customer}。定制师发来的「{kind}」内容：\n{content[:2000]}"}],
-            temperature=0.7, max_tokens=500)
-        return {"kind": kind, "customer": customer,
-                "reply": str(data.get("reply", "")),
-                "sentiment": str(data.get("sentiment", "")),
-                "asks": list(data.get("asks") or [])}
+    def deliverable_feedback(self, kind: str, content: str, customer: str = "客户", *, order_id: str = "", channel: str = "document") -> dict:
+        if order_id and self._store is not None:
+            from .customer_context import guarded_reply
+            row = self._store.order(order_id)
+            if not row:
+                raise ValueError(f"未找到订单: {order_id}")
+            payload = json.loads(row.get("payload") or "{}")
+            if kind in ("出团通知书", "departure_notice") and (
+                    payload.get("demo_data") or payload.get("showcase_realistic")):
+                stamp = f"{channel}:demo-notice:{int(time.time() * 1000)}"
+                reply = "出团通知书我看到了，集合时间和联系人我会再核对一下。"
+                # 关键：把客户收到的文档正文写入客户记忆。只记一句「知道」会让
+                # 后续追问时客户完全不知道自己收到过什么，只能复述最初需求。
+                self._store.add_customer_turn(
+                    order_id, channel, "consultant",
+                    f"定制师发来的「{kind}」内容：\n{str(content or '')[:6000]}",
+                    stamp + ":doc")
+                self._store.add_customer_turn(order_id, channel, "customer", reply, stamp)
+                return {"kind": kind, "customer": row["customer"], "reply": reply,
+                        "sentiment": "满意", "asks": [],
+                        "consistency": {"fallback": False, "demo_notice_ack": True}}
+            out = guarded_reply(self._store, self._llm, order_id, channel,
+                                f"定制师发来的「{kind}」内容：\n{content[:6000]}", reference=content,
+                                feedback=True)
+            return {"kind": kind, "customer": row["customer"], **out}
+        raise ValueError("客户文档反馈需要绑定订单")

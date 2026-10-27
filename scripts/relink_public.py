@@ -3,7 +3,7 @@
 trycloudflare 快速隧道的地址和 cloudflared 进程绑定，进程一停地址就永久失效。
 但「链接打不开」有三种完全不同的原因，处理方式也不同：
 
-  1. 源站没起来（后端 18010 / 生产预览 4180 挂了）→ 公网返回 502，**隧道是好的，千万别换地址**；
+  1. 源站没起来（后端 18020 / 生产预览 4180 挂了）→ 公网返回 502，**隧道是好的，千万别换地址**；
   2. 隧道进程死了 / 校园网掐了出网 7844 → 必须重启隧道拿新地址，再同步 README 与 GitHub；
   3. 只是 README 和线上仓库不一致 → 重新发布一次即可。
 
@@ -31,7 +31,7 @@ FRONTEND = ROOT / "frontend"
 URL_FILE = LOGS / "PUBLIC-URL.txt"
 LOG = LOGS / "cloudflared-preview.log"
 CF = Path(r"C:\Program Files (x86)\cloudflared\cloudflared.exe")
-BACKEND_PORT = 18010
+BACKEND_PORT = 18020
 PREVIEW_PORT = 4180
 TARGET = f"http://127.0.0.1:{PREVIEW_PORT}"
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -85,7 +85,7 @@ def start_preview() -> None:
 
 
 def ensure_origin(wait_seconds: int = 60) -> bool:
-    """公网要能打开，先得让「源站」活着：后端 18010 + 生产预览 4180。"""
+    """公网要能打开，先得让「源站」活着：后端 18020 + 生产预览 4180。"""
     if not FRONTEND.joinpath("dist", "index.html").exists():
         print("[..] 没有生产构建，先跑一次 npm run build")
         subprocess.run(["cmd", "/c", "npm run build"], cwd=str(FRONTEND),

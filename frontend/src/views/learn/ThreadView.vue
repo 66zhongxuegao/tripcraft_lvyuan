@@ -152,7 +152,6 @@
         <div class="m-head">
           <span class="m-title">{{ preview.title }}</span>
           <div class="m-actions">
-            <button class="tc-btn ghost mini" @click="exportMd(preview.title, preview.content)"><SIcon name="filetext" :size="13" /> 导出 .md</button>
             <button class="tc-btn ghost mini" @click="preview = null">关闭</button>
           </div>
         </div>
@@ -217,25 +216,34 @@
         {{ diffToast.text }}
       </div>
     </transition>
-  </div>
-
-  <!-- 悬浮翻译面板：保持 Markdown 渲染 -->
-  <div v-if="tr.open" class="tr-mask" @click.self="tr.open = false">
-    <div class="tr-panel">
-      <div class="tr-hd">
-        <b>翻译</b>
-        <select v-model="tr.target" @change="doTranslate">
-          <option v-for="l in LANGS" :key="l" :value="l">{{ l }}</option>
-        </select>
-        <span class="tr-hint">保持 Markdown 结构与术语</span>
-        <button class="tr-x" @click="tr.open = false">关闭</button>
-      </div>
-      <div class="tr-body">
-        <div v-if="tr.loading" class="tr-loading">翻译中…</div>
-        <MarkdownView v-else-if="tr.text" :text="tr.text" />
-        <div v-else class="tr-loading">{{ tr.error || '没有可翻译的内容' }}</div>
+  <!-- 悬浮翻译面板：保持 Markdown 渲染。
+       两个约束同时满足：
+       1) **本组件顶层只能有一个根元素**（这里是 .thread）——否则 App.vue 的
+          <transition mode="out-in"> 无法解析动画元素，leave 钩子不完成，
+          离开本页后新路由不挂载 → 正文空白（已发生的演示阻断）。
+       2) 浮层用 <Teleport to="body"> 挂到 body：过渡类会给视图根加 transform，
+          否则 position: fixed 会被该 transform 变成「相对祖先定位」而错位。
+       Teleport 放在 .thread 内部，既保住单根，又保住 viewport 定位。
+       scoped 样式对 Teleport 出去的内容依然生效（作用域属性随节点一起搬走）。 -->
+  <Teleport to="body">
+    <div v-if="tr.open" class="tr-mask" @click.self="tr.open = false">
+      <div class="tr-panel">
+        <div class="tr-hd">
+          <b>翻译</b>
+          <select v-model="tr.target" @change="doTranslate">
+            <option v-for="l in LANGS" :key="l" :value="l">{{ l }}</option>
+          </select>
+          <span class="tr-hint">保持 Markdown 结构与术语</span>
+          <button class="tr-x" @click="tr.open = false">关闭</button>
+        </div>
+        <div class="tr-body">
+          <div v-if="tr.loading" class="tr-loading">翻译中…</div>
+          <MarkdownView v-else-if="tr.text" :text="tr.text" />
+          <div v-else class="tr-loading">{{ tr.error || '没有可翻译的内容' }}</div>
+        </div>
       </div>
     </div>
+  </Teleport>
   </div>
 </template>
 
@@ -554,13 +562,7 @@ async function submitQuiz(m: any) {
 }
 
 function openAsset(a: any) { preview.value = { title: a.title, content: a.content } }
-function exportMd(title: string, content: string) {
-  const blob = new Blob([content], { type: 'text/markdown;charset=utf-8' })
-  const url = URL.createObjectURL(blob)
-  const link = document.createElement('a')
-  link.href = url; link.download = title + '.md'; link.click()
-  URL.revokeObjectURL(url)
-}
+// R05：学员界面不提供 Markdown 导出；预览/复制等现有能力保留，内部渲染流程不变。
 </script>
 
 <style scoped lang="scss">

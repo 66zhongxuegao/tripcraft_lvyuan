@@ -14,6 +14,7 @@ from ..services.learner_brief import LearnerBrief
 from ..agents.scorer import ScoringAgent
 from ..contracts.enums import DIMENSION_NAMES, STEP_ORDER, CheckpointType, Dimension, StepId
 from ..contracts.rubric import RUBRICS
+from ..contracts.entry_documents import FOREIGN_DOCUMENTS
 from ..contracts.skill_points import SKILL_POINTS, SKILL_POINTS_BY_ID, by_step
 from ..storage.db import Store
 from ..agents.scenario import DispatchGenerator, missing_fields
@@ -23,6 +24,7 @@ from .learner_brief import build_brief
 from ..contracts.steps import STEP_EVIDENCE
 from .workflow import (ACTION_LABELS, MAX_STAGE, MANUAL_ACTIONS, gates_for,
                         is_known_action, stage_hint)
+from .competition_mode import enabled as competition_easy
 
 # 平台订单状态（8 态）
 ORDER_STEPS = [
@@ -72,29 +74,28 @@ SEED_ORDERS = [
 UNPUBLISHED_IDS = ("9000000000000007", "9000000000000008", "9000000000000009", "9000000000000010")
 PUBLISH_INTERVAL_MIN = 2
 
-# 订单级设定：本平台**只做入境接待**，不存在国内单。
-# 中文单同样是入境单——客源地为港澳台/新加坡等中文客源市场。
+# 现有演示池采用入境客源；国内订单的人设由共享客户规则另行处理。
 SEED_ORDER_META: dict[str, dict] = {
     "9000000000000001": {"source_market": "香港", "language": "中文",
                          "documents": "港澳居民来往内地通行证（回乡证）"},
     "9000000000000002": {"source_market": "新加坡", "language": "中文",
-                         "documents": "新加坡普通护照（免签入境）"},
+                         "documents": FOREIGN_DOCUMENTS},
     "9000000000000003": {"source_market": "台湾", "language": "中文",
                          "documents": "台湾居民来往大陆通行证（台胞证）"},
     "9000000000000004": {"source_market": "澳门", "language": "中文",
                          "documents": "港澳居民来往内地通行证（回乡证）"},
     "9000000000000005": {"source_market": "美国", "language": "English",
-                         "documents": "美国普通护照（需办理签证）"},
+                         "documents": FOREIGN_DOCUMENTS},
     "9000000000000006": {"source_market": "香港", "language": "中文",
                          "documents": "港澳居民来往内地通行证（回乡证）"},
     "9000000000000007": {"source_market": "台湾", "language": "中文", "published": False,
                          "documents": "台湾居民来往大陆通行证（台胞证）"},
     "9000000000000008": {"source_market": "新加坡", "language": "中文", "published": False,
-                         "documents": "新加坡普通护照（免签入境）"},
+                         "documents": FOREIGN_DOCUMENTS},
     "9000000000000009": {"source_market": "澳门", "language": "中文", "published": False,
                          "documents": "港澳居民来往内地通行证（回乡证）"},
     "9000000000000010": {"source_market": "英国", "language": "English", "published": False,
-                         "documents": "英国普通护照（需办理签证）"},
+                         "documents": FOREIGN_DOCUMENTS},
 }
 
 DEFAULT_SOURCE_MARKET = "香港"
@@ -184,7 +185,7 @@ def injectable_points() -> set[str]:
 
 PLAN_LIMIT = 12
 
-# 覆盖度门槛（PRD 19.4）：低于该值本次不写画像
+# 覆盖度参考线：用于复盘提示，不限制画像写回。
 COVERAGE_THRESHOLD = 0.8
 
 # 低置信度升级阈值（PRD 25.6）
@@ -222,7 +223,15 @@ class PracticeService:
         """挂上导演总线：学员动作会自动送入总线并触发事件注入（D-047）。"""
         self._director = director
 
-    def seed(self, user_id: str = "u-demo") -> None:
+    def seed(self, user_id: str) -> None:
+        """播种**演示**订单（模拟环境数据）。
+
+        只允许给单一 demo 账号用：SEED_ORDERS 是固定 order_id 的演示单，
+        第二次用另一个 user_id 调它会把这些单整体改归属（多账号隔离直接破）。
+        因此这里对**已有归属**的订单直接跳过，绝不抢别人的单。
+        新用户的初始订单请用 `generate_dispatch(user_id, llm=None, count=1)`
+        （由 spawn_order 生成全局唯一 order_id，不需要模型）。
+        """
         boot = datetime.now()
         # 教学侧基线（只在账号没有任何能力数据时写一次）：
         # 演示学员「每个维度的前 3 个技能点已经学过」（教学掌握度 ≥ 60），
@@ -239,6 +248,8 @@ class PracticeService:
                                             real_v=0)
         for oid, cust, dest, status, stage, created in SEED_ORDERS:
             old_row = self._store.order(oid)
+            if old_row and (old_row.get("user_id") or "") not in ("", user_id):
+                continue          # 已被别人持有：不抢、不改归属（多账号隔离）
             old = json.loads((old_row or {}).get("payload") or "{}")
             payload = {**old, "created_at": created, **SEED_ORDER_META.get(oid, {})}
             if oid in UNPUBLISHED_IDS and not payload.get("published"):
@@ -250,13 +261,19 @@ class PracticeService:
             self._store.upsert_order(oid, user_id, cust, dest, status, stage, payload=payload)
         self._seed_contacts()
         self._seed_notices(user_id)
-        self._backfill_actions()
+        self._backfill_actions(user_id)
 
-    def _backfill_actions(self) -> None:
+    def _backfill_actions(self, user_id: str) -> None:
         """种子里已经处在较后阶段的订单，把「此前应该做过的动作」补齐，
-        否则门槛账本与实际阶段对不上（例如阶段 4 却没抢过单）。"""
+        否则门槛账本与实际阶段对不上（例如阶段 4 却没抢过单）。
+
+        只补**属于该账号**的演示单：动作账本是考核证据，绝不能写到别人的订单上。
+        """
         from datetime import datetime, timedelta
         for oid, _cust, _dest, status, stage, created in SEED_ORDERS:
+            row = self._store.order(oid)
+            if not row or (row.get("user_id") or "") != user_id:
+                continue
             if status == "禁用" or stage <= 0 or self._store.actions(oid):
                 continue
             try:
@@ -309,6 +326,7 @@ class PracticeService:
 
     @staticmethod
     def _to_order(o: dict) -> dict:
+        from .customer_card import render_intent
         idx = int(o["stage_index"] or 0)
         payload = json.loads(o.get("payload") or "{}")
         return {
@@ -319,7 +337,7 @@ class PracticeService:
             "difficulty": payload.get("difficulty", ""),
             "target_skill_points": payload.get("target_skill_points", []),
             "rationale": (payload.get("brief") or {}).get("rationale", ""),
-            "intent": payload.get("intent", ""),
+            "intent": render_intent(o["_customer_card"]) if o.get("_customer_card") else payload.get("intent", ""),
             "generated": bool(payload.get("generated", False)),
             "source_market": payload.get("source_market", DEFAULT_SOURCE_MARKET),
             "language": payload.get("language", "中文"),
@@ -355,26 +373,51 @@ class PracticeService:
             self._set_payload(order_id, dispatch_at=payload["dispatch_at"])
         info = dispatch.status(order_id, row["created_at"], payload, grabbed,
                                first_call_at=self._store.action_at(order_id, "first_call"), now=now)
+        # 演示实例专用：固定案例单在「注册 → 初测/学习 → 接单」的等待期内不作废（可重复续期）。
+        # 普通实例/普通订单：maybe_renew_demo_window 立刻返回 None，规则与原来完全一致。
+        if info.get("lost") or info.get("expired"):
+            try:
+                from tripcraft.services.scenario_service import maybe_renew_demo_window
+                renewed = maybe_renew_demo_window(self._store, order_id, row)
+            except Exception:                     # noqa: BLE001 - 演示续期失败不得影响普通派单语义
+                renewed = None
+            if renewed and not grabbed:
+                row = self._store.order(order_id) or row
+                payload = json.loads(row["payload"] or "{}")
+                info = dispatch.status(order_id, row["created_at"], payload, grabbed,
+                                       first_call_at=self._store.action_at(order_id, "first_call"),
+                                       now=now)
         if info.get("lost") and row["status"] == "正常":
             self._store.upsert_order(order_id, row["user_id"], row["customer"], row["destination"],
                                      "已派他人", int(row["stage_index"] or 0), payload=payload)
             self._store.add_event(order_id, "dispatch_lost", {"reason": info.get("lost_reason", "")})
         fc = info.get("first_call")
-        if fc and fc.get("missed") and not fc.get("done") and \
+        if fc and fc.get("missed") and \
                 not self._store.has_action(order_id, "deadline_miss:first_call"):
             self._store.add_action(order_id, "deadline_miss:first_call", {})
             self._store.add_event(order_id, "deadline_miss", {"what": "首呼超时"})
         return info
 
     def list_orders(self, user_id: str, mine_only: bool = True) -> list[dict]:
-        """订单管理 = 我的订单。未抢的阶段 0 订单属于平台，只在消息中心出现。"""
+        """订单管理只展示本人成功抢到的订单，各阶段与取消状态均遵守同一规则。"""
         out = []
         for o in self._store.orders(user_id):
-            if mine_only and int(o["stage_index"] or 0) == 0 \
-                    and not self._store.has_action(o["order_id"], "grab") \
-                    and o["status"] != "禁用":
-                continue   # 阶段 0 未抢且未取消的单不是我的（含未放出的候选单）
+            claimed = False
+            for action in self._store.actions(o["order_id"]):
+                if action["action"] != "grab":
+                    continue
+                evidence = json.loads(action.get("payload") or "{}")
+                # 演示种子补齐的流程动作不代表学员在抢单页成功接单。
+                if not isinstance(evidence, dict) or evidence.get("backfill"):
+                    continue
+                if evidence.get("by") not in (None, "", user_id):
+                    continue
+                claimed = True
+                break
+            if mine_only and not claimed:
+                continue
             item = self._to_order(o)
+            item["claimed"] = claimed
             if item["stage_index"] == 0 and item["status"] == "正常":
                 item["dispatch"] = self.dispatch_info(item["order_id"])
             out.append(item)
@@ -457,6 +500,9 @@ class PracticeService:
             payload["target_skill_points"] = brief.get("target_skill_points", [])
         self._store.upsert_order(oid, user_id, spec.customer, spec.destination,
                                  "正常", 0, payload=payload)
+        from .customer_card import render_intent
+        payload["intent"] = render_intent(self._store.ensure_customer_card(oid))
+        self._set_payload(oid, intent=payload["intent"])
         self._store.add_event(oid, "dispatch_generated",
                               {"difficulty": payload.get("difficulty", ""),
                                "source_market": spec.source_market,
@@ -490,6 +536,16 @@ class PracticeService:
         self._publish_due()
         out = []
         for o in self._store.orders(user_id):
+            # 演示实例专用：此前已被惰性判负的固定案例单，在这里复活为「正常」再参与筛选；
+            # 已抢单/已完成/普通订单不受影响（helper 内部逐条判定，普通实例直接 None）。
+            if int(o["stage_index"] or 0) == 0 and o["status"] != "正常" \
+                    and not self._store.has_action(o["order_id"], "grab"):
+                try:
+                    from tripcraft.services.scenario_service import maybe_renew_demo_window
+                    if maybe_renew_demo_window(self._store, o["order_id"], o):
+                        o = self._store.order(o["order_id"]) or o
+                except Exception:                 # noqa: BLE001
+                    pass
             if int(o["stage_index"] or 0) != 0 or o["status"] != "正常":
                 continue
             if self._store.has_action(o["order_id"], "grab"):
@@ -497,7 +553,7 @@ class PracticeService:
             if json.loads(o["payload"] or "{}").get("published") is False:
                 continue          # 还没到放出时间的候选单
             info = self.dispatch_info(o["order_id"])
-            if info.get("lost"):
+            if info.get("lost") and not competition_easy():
                 continue
             item = self._to_order(o)
             item["dispatch"] = info
@@ -528,12 +584,19 @@ class PracticeService:
         ]
         o["gate"] = self.gate_report(order_id)
         o["dispatch"] = self.dispatch_info(order_id)
-        # 订单级客户人设（与语音/群聊同源）：通话界面在拨打前就能显示"对方是什么人"
-        p = persona_for(o.get("customer") or "客户", o.get("destination") or "",
-                        o.get("source_market", "香港"), o.get("language", "中文"),
-                        order_id, o.get("personality", ""))
-        o["persona"] = {"name": p.name, "nationality": p.nationality, "age": p.age,
-                        "gender": p.gender, "language": p.language}
+        # 订单级客户人设（与语音/群聊同源）：通话界面在拨打前就能显示"对方是什么人"。
+        # R08：这里只出**公开白名单**字段（与 api/public_dto.public_customer_from_facts 同字段集），
+        # 隐藏人设（hidden/quirks/preferences/traits/personality）与成本底牌一律不下发前端。
+        from .customer_order_facts import facts_from_order_row
+        facts = facts_from_order_row(row)
+        o["persona"] = {
+            "name": facts.customer or "客户",
+            "nationality": facts.source_market,
+            "age": facts.age,
+            "gender": facts.gender,
+            "language": facts.language,
+            "docs": facts.public_facts()["documents"],
+        }
         return o
 
     def order_steps(self, order_id: str) -> list[dict]:
@@ -564,7 +627,8 @@ class PracticeService:
                         "urgent": urgent, "deadline_at": deadline_at})
         return out
 
-    def messages(self, user_id: str = "u-demo") -> dict:
+    def messages(self, user_id: str) -> dict:
+        """消息中心：身份必须由调用方从登录会话传入，禁止默认成 demo 用户。"""
         rows = self._store.notices(user_id)
         msgs = [{
             "id": r["notice_id"], "group": r["group_key"], "time": r["at"],
@@ -590,7 +654,7 @@ class PracticeService:
             raise ValueError(f"未知动作: {action}")
         if action == "grab":
             info = self.dispatch_info(order_id)
-            if info.get("lost"):
+            if info.get("lost") and not competition_easy():
                 raise ValueError(info.get("lost_reason", "该单已被接走"))
             if not self._store.has_action(order_id, "grab"):
                 self._set_payload(order_id, grabbed_at=datetime.now().isoformat(timespec="seconds"))
@@ -600,7 +664,9 @@ class PracticeService:
         advance = self.try_advance(order_id)
         # 动作自动进导演总线：命中规则就注入事件型考点（学员无需手动触发）
         incident = None
-        if self._director is not None:
+        # 门槛动作是幂等的：重复投递同一交付物或重复登记同一动作，
+        # 只能推进状态，不能让导演总线把同一个突发事件再触发一次。
+        if fresh and self._director is not None:
             try:
                 incident = self._director.on_action(order_id, action)
             except Exception:
@@ -610,16 +676,25 @@ class PracticeService:
                 "advance": advance, "incident": incident}
 
     def _action_ok(self, order_id: str, gate) -> tuple[bool, str]:
+        # 演示放行只跳过表单/拦截网，不跳过阶段动作；否则任何动作都会跨阶。
         if not self._store.has_action(order_id, gate.action):
             return False, f"待完成：{gate.hint}"
         if gate.within_min:
+            # 时效属于考核记录；补做后按动作完成推进，不能把历史超时变成永久死锁。
+            # 首呼时限与派单倒计时同源（含订单难度覆盖），并补记未被轮询捕获的超时。
+            limit = gate.within_min
             start = self._store.action_at(order_id, "grab")
+            if gate.action == "first_call":
+                fc = self.dispatch_info(order_id).get("first_call") or {}
+                limit = fc.get("limit_min", limit)
+                start = self._payload(order_id).get("grabbed_at") or start
             done = self._store.action_at(order_id, gate.action)
             if start and done:
                 from datetime import datetime
                 minutes = (datetime.fromisoformat(done) - datetime.fromisoformat(start)).total_seconds() / 60
-                if minutes > gate.within_min:
-                    return False, (f"已超时：距抢单 {minutes:.0f} 分钟，超过 {gate.within_min} 分钟时限")
+                if minutes > limit:
+                    return True, (f"已完成；距抢单 {minutes:.0f} 分钟，超过 {limit} 分钟时限，"
+                                  "超时已单独记录")
         return True, ""
 
     def gate_report(self, order_id: str) -> dict:
@@ -649,7 +724,9 @@ class PracticeService:
         }
 
     def try_advance(self, order_id: str, max_steps: int = 4) -> dict:
-        """本阶段门槛全达成则推进平台状态；可连续推进（一次动作补齐多步）。"""
+        """本阶段门槛全达成则推进平台状态；比赛演示一次动作最多推进一阶。"""
+        if competition_easy():
+            max_steps = 1
         o = self._store.order(order_id)
         if not o:
             return {"order_id": order_id, "advanced": []}
@@ -956,7 +1033,7 @@ class PracticeService:
         return ""
 
     def score_order(self, order_id: str, llm) -> dict:
-        """评分 Agent 判档 → 覆盖校验 → 低置信度升级 → 写回画像。"""
+        """按已有证据评分并写回画像；覆盖度独立用于复盘。"""
         o = self._store.order(order_id)
         if not o:
             return {"ok": False, "error": f"未找到订单: {order_id}", "scored": 0}
@@ -968,6 +1045,15 @@ class PracticeService:
 
         cov = self.coverage(order_id)
         cal = self.calibration_gate()
+        # 演示订单的数据标记：点击生成后把完整评分直接采纳。
+        # 普通订单不带此标记，仍严格走置信度／边界复核。
+        try:
+            order_payload = json.loads(o.get("payload") or "{}")
+        except (TypeError, ValueError):
+            order_payload = {}
+        demo_auto_accept = bool(order_payload.get("auto_accept_scores"))
+        if demo_auto_accept:
+            cal = {**cal, "weight": 1.0, "demo_auto_accept": True}
         covered_ids = {i["skill_point_id"] for i in cov["items"] if i["covered"]}
         # 只评「已覆盖」的目标技能点：未覆盖的没有素材，评分也只会是幻觉
         ids = [i for i in covered_ids if i in RUBRICS]
@@ -994,7 +1080,9 @@ class PracticeService:
                 dropped.append(r.skill_point_id)      # 每分必有证据（PRD 21.2）
                 continue
             reason = self._escalation_reason(r)
-            status = "待复核" if reason else "已入库"
+            status = "已入库" if demo_auto_accept else ("待复核" if reason else "已入库")
+            if demo_auto_accept and reason:
+                reason = "演示订单自动采纳（原复核原因：" + reason + "）"
             self._store.upsert_order_score(order_id, r.skill_point_id, r.score, r.level,
                                            r.hit_negative, r.evidence, r.comment, "实战",
                                            confidence=r.confidence, status=status, review_reason=reason)
@@ -1005,8 +1093,8 @@ class PracticeService:
             if status == "待复核":
                 escalated.append(item)
                 continue
-            if not cov["passed"] or cal["weight"] <= 0:
-                continue                              # 覆盖不足 / 无校准基线：本次不写画像
+            if cal["weight"] <= 0:
+                continue                              # 校准与低置信度规则独立保留。
             if cal["weight"] < 1.0:
                 # 降权（校准未达标）下只采信「暴露薄弱」的判定：
                 # 低于掌握门槛（M1，<60）才写画像；「证明能力」的高判定一律不采信，
@@ -1030,23 +1118,15 @@ class PracticeService:
                          "passed": cov["passed"]},
             "calibration": cal,
             "thresholds": self.thresholds(),
-            "deferred": (not cov["passed"] or cal["weight"] <= 0) and bool(entries),
-            "deferred_reason": self._deferred_reason(cov, cal),
+            "deferred": cal["weight"] <= 0 and bool(entries),
+            "deferred_reason": self._deferred_reason(cal),
             "skill_points": entries,
             "average": round(sum(e["score"] for e in entries) / len(entries)) if entries else None,
         }
 
     @staticmethod
-    def _deferred_reason(cov: dict, cal: dict) -> str:
-        parts = []
-        if not cov["passed"]:
-            parts.append(f"覆盖度 {cov['covered']}/{cov['targets']}"
-                         f"（{round(cov['ratio'] * 100)}%）低于门槛 {round(cov['threshold'] * 100)}%")
-        if cal["weight"] <= 0:
-            parts.append(cal["reason"])
-        elif cal["weight"] < 1.0:
-            parts.append(cal["reason"])
-        return "；".join(parts) + "，本次不写画像" if parts else ""
+    def _deferred_reason(cal: dict) -> str:
+        return cal.get("reason", "") if cal["weight"] < 1.0 else ""
 
     def review_score(self, order_id: str, sp: str, decision: str, score: float | None = None) -> dict:
         """人工复核低置信度判定：accept 采纳 / override 改判 / reject 驳回。"""

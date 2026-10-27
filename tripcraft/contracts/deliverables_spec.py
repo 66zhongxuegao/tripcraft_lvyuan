@@ -17,6 +17,9 @@ PLATFORM = "平台"
 SUPPLIER = "地接社"
 INTERNAL = "内部"
 
+# 两份行后文件均成功提交即完成一次训练；提交先后顺序不限制。
+PRACTICE_FINAL_CODES = ("settlement", "review")
+
 
 @dataclass(frozen=True)
 class Column:
@@ -36,6 +39,9 @@ class Field:
     unit: str = ""
     options: tuple[str, ...] = ()
     columns: tuple[Column, ...] = ()   # type == rows
+    # 内部字段：只进内部渲染（拦截网 / 评分 / 财务 / 台账），**绝不进客户输出**
+    # （客户输出 = 预览、PDF、客户聊天卡片、客户 Agent 反馈上下文）
+    internal: bool = False
 
     @property
     def is_rows(self) -> bool:
@@ -60,8 +66,10 @@ class DeliverableSpec:
     conditional_actions: tuple[tuple[str, str, str], ...] = ()
 
 
-def _f(key, label, type="text", required=False, placeholder="", help="", unit="", options=(), columns=()):
-    return Field(key, label, type, required, placeholder, help, unit, tuple(options), tuple(columns))
+def _f(key, label, type="text", required=False, placeholder="", help="", unit="", options=(),
+       columns=(), internal=False):
+    return Field(key, label, type, required, placeholder, help, unit, tuple(options),
+                 tuple(columns), internal)
 
 
 # ---------------------------------------------------------------- 逐日行程列（C3.1 六要素）
@@ -94,13 +102,13 @@ DELIVERABLES: tuple[DeliverableSpec, ...] = (
             _f("want", "希望满足", "textarea", placeholder="节奏、偏好景点、餐食…"),
             _f("alternative", "可替代", "textarea", placeholder="酒店可降档、用车可换…"),
             _f("refuse", "明确不要", "textarea", placeholder="不去的地方、不接受的方式…"),
-            _f("budget", "预算口径", "textarea", required=True, placeholder="人均还是总价？区间？含不含大交通？"),
+            _f("budget", "预算范围", "textarea", required=True, placeholder="人均还是总价？区间？含不含大交通？"),
             _f("docs", "证件与入境", placeholder="回乡证 / 台胞证 / 护照+签证…"),
             _f("taboo", "饮食与宗教禁忌", placeholder="如 清真、忌猪肉与酒"),
             _f("decision", "决策人", placeholder="由谁拍板"),
             _f("note", "其他备注", "textarea"),
         ),
-        extra_sections=(("确认方式", "请客户逐项确认；有异议的条目在上方对应字段中标注。"),),
+        extra_sections=(("确认方式", "请客户逐项确认；有异议的条目在上方对应项里标注。"),),
     ),
     DeliverableSpec(
         id="资源询价记录", code="resource_quote", step="S4", audience=(INTERNAL,),
@@ -152,11 +160,14 @@ DELIVERABLES: tuple[DeliverableSpec, ...] = (
                help="一行一项：项目 / 说明 / 数量 / 单价 / 金额"),
             _f("total", "合计金额", "number", required=True, unit="元"),
             _f("per_person", "人均", "number", unit="元"),
-            _f("cost", "成本", "number", unit="元", help="地接/资源采购成本，用于算毛利"),
+            _f("cost", "成本（内部）", "number", unit="元", internal=True,
+               help="地接/资源采购成本，用于算毛利；只进内部核算，不会出现在客户看到的文档里"),
             _f("insurance", "保险项", required=True, placeholder="如 旅游意外险 30 万，60 元/人"),
             _f("pending", "待确认项与锁定时限", "textarea", placeholder="酒店与用车待确认，资源方 2 小时内回复后锁定"),
-            _f("fx", "汇率与支付（入境单）", "textarea", placeholder="汇率口径与锁定时间、支付方式、手续费承担、发票/收据"),
+            _f("fx", "汇率与支付（入境单）", "textarea", placeholder="汇率与锁价时间、支付方式、手续费承担、发票/收据"),
             _f("note", "说明", "textarea"),
+            _f("internal_note", "内部核算说明（不发给客户）", "textarea", internal=True,
+               help="成本、毛利、返点等只给自己看的数字写这里；它只进内部档案，不会出现在客户输出（预览 / PDF / 客户卡片）里"),
         ),
     ),
     DeliverableSpec(
@@ -210,8 +221,8 @@ DELIVERABLES: tuple[DeliverableSpec, ...] = (
             _f("total_settle", "地接结算合计", "number", unit="元"),
             _f("total_ours", "我方报价合计", "number", unit="元"),
             _f("diff", "合计差异", "number", unit="元"),
-            _f("actual_cost", "实际成本", "number", unit="元"),
-            _f("actual_margin", "实际毛利", "number", unit="元"),
+            _f("actual_cost", "实际成本", "number", unit="元", internal=True),
+            _f("actual_margin", "实际毛利", "number", unit="元", internal=True),
             _f("reason", "差异原因", "textarea", placeholder="哪几项对不上、为什么"),
             _f("decision", "处理决定", "textarea", placeholder="据实结算 / 要求核减 / 走申诉"),
         ),
@@ -230,7 +241,7 @@ DELIVERABLES: tuple[DeliverableSpec, ...] = (
             _f("issue", "问题与投诉", "textarea"),
             _f("remedy", "补救措施", "textarea"),
             _f("balance_state", "尾款状态", "select", required=True, options=("已结清", "未结清")),
-            _f("profit", "实际利润", "number", unit="元"),
+            _f("profit", "实际利润", "number", unit="元", internal=True),
             _f("good", "做得好的", "textarea"),
             _f("improve", "待改进的", "textarea", required=True),
             _f("next", "下一步动作", "textarea", placeholder="针对性补练哪个技能点"),
@@ -255,10 +266,11 @@ SURFACE = {
     "回访与复盘记录": "ledger",
 }
 
-# 每一步都留一段自由正文：口径、注意事项、想强调的事，学员自己写。
+# 每一步都留一段自由正文：补充说明、注意事项、想强调的事，学员自己写。
 # 固定字段保证平台与评分能核对，自由正文保证表达不被模板阉割。
-FREEFORM = _f("freeform", "补充说明（自由编辑）", "textarea",
-              help="这一段由你自己写：口径补充、注意事项、给对方的提醒；会附在文档末尾")
+FREEFORM = _f("freeform", "补充说明（发给对方）", "textarea",
+              help="这一段会随文档发给对方（客户 / 地接）：写注意事项、提醒、给对方的信息；"
+                   "成本、毛利这类只给自己看的内容请写到「内部核算说明」那一栏")
 
 DELIVERABLES = tuple(
     replace(d, surface=SURFACE.get(d.id, "document"), fields=d.fields + (FREEFORM,))
@@ -291,9 +303,50 @@ def _rows_to_table(columns: tuple[Column, ...], rows: list[dict]) -> str:
     return "\n".join([head, sep] + body)
 
 
-def render(spec: DeliverableSpec, values: dict[str, Any], context: dict[str, Any] | None = None) -> str:
-    """把结构化字段渲染成正式文档（Markdown）。两个 Agent 读到的就是它。"""
+# 客户可见文案里不得出现的内部口径（出现即从客户输出中剔除，并记入 withheld 供学员知情）
+CUSTOMER_LEAK_TERMS: tuple[str, ...] = (
+    "成本", "毛利", "利润率", "毛利率", "采购价", "进货价", "底价", "返点", "净赚", "加价率",
+)
+
+
+def _customer_safe_text(text: str) -> tuple[str, list[str]]:
+    """逐行剔除含内部口径的句子：客户输出只保留可以给客户看的内容。
+
+    返回 (保留的文本, 被剔除的词)。整段都被剔除时返回空串——文档里不留任何「已隐藏」痕迹，
+    学员的知情通过接口的 `customer_withheld` 与工作台提示完成。
+    """
+    kept: list[str] = []
+    dropped: list[str] = []
+    for line in str(text or "").splitlines():
+        hit = [t for t in CUSTOMER_LEAK_TERMS if t in line]
+        if hit:
+            dropped.extend(hit)
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip(), sorted(set(dropped))
+
+
+def is_customer_facing(spec: DeliverableSpec) -> bool:
+    """这份交付物会不会真的发给客户。
+
+    只有 `audience` 含「客户」的文档才做客户化（脱敏）处理；
+    内部/地接专用文档（资源询价、地接结算核对单、回访与复盘记录）保留自身核算内容。
+    """
+    return CUSTOMER in spec.audience
+
+
+def render(spec: DeliverableSpec, values: dict[str, Any], context: dict[str, Any] | None = None,
+           audience: str = "internal") -> str:
+    """把结构化字段渲染成正式文档（Markdown）。
+
+    `audience="internal"`（默认）＝内部档案：含内部字段（成本等）与核算汇总，
+    用于拦截网算术校验、评分证据、财务与台账；
+    `audience="customer"`＝**客户输出**：不含任何 internal 字段、不含核算汇总，
+    且客户可见正文里出现内部口径（成本/毛利…）的句子会被剔除。
+    客户输出去向：工作台预览、PDF 导出、客户聊天卡片、客户 Agent 反馈上下文。
+    """
     ctx = context or {}
+    customer_view = audience == "customer"
     out: list[str] = [f"# {spec.title}", ""]
     meta = [f"**订单** {ctx.get('order_id', '—')}", f"**客户** {ctx.get('customer', '—')}",
             f"**客源地** {ctx.get('source_market', '—')}", f"**目的地** {ctx.get('destination', '—')}",
@@ -301,28 +354,77 @@ def render(spec: DeliverableSpec, values: dict[str, Any], context: dict[str, Any
     out += ["　".join(meta), "", f"> {spec.purpose}", ""]
 
     for f in spec.fields:
+        if customer_view and f.internal:
+            continue                      # 内部字段（成本 / 内部核算说明）不进客户输出
         val = values.get(f.key)
-        out.append(f"## {f.label}")
+        heading = f"## {f.label}"
         if f.is_rows:
             rows = val if isinstance(val, list) else []
-            table = _rows_to_table(f.columns, rows)
-            out.append(table if rows else "（未填写）")
+            if customer_view:
+                rows = [{k: (v if not isinstance(v, str) else _customer_safe_text(v)[0])
+                         for k, v in (r or {}).items()} for r in rows]
+                rows = [r for r in rows if any(str(v or "").strip() for v in r.values())]
+            if not rows and (val if isinstance(val, list) else []):
+                continue                  # 整表内容都被剔除：客户版不保留空壳小节
+            out.append(heading)
+            out.append(_rows_to_table(f.columns, rows) if rows else "（未填写）")
         elif isinstance(val, list):
+            out.append(heading)
             out.append("、".join(str(v) for v in val) or "（未填写）")
         else:
-            text = str(val).strip() if val not in (None, "") else "（未填写）"
+            empty = val in (None, "")
+            text = "（未填写）" if empty else str(val).strip()
+            if customer_view and not empty:
+                safe, _dropped = _customer_safe_text(text)
+                if not safe:
+                    continue              # 整段都被剔除：客户版连小节标题都不留
+                text = safe
+            out.append(heading)
             out.append(f"{text}{f.unit if text != '（未填写）' else ''}")
         out.append("")
 
     for head, body in spec.extra_sections:
+        if customer_view:
+            body = _customer_safe_text(body)[0]
+            if not body:
+                continue
         out += [f"## {head}", body, ""]
 
-    # 分项报价额外渲染「可核对的汇总行」——双层拦截网的算术校验读这一段
-    if spec.id == "分项报价":
+    # 分项报价的「可核对汇总行」是内部核算（含成本），只进内部渲染；
+    # 双层拦截网的算术校验读的是内部渲染，客户版本不需要它。
+    if spec.id == "分项报价" and not customer_view:
         out += _quote_summary(values)
 
-    out += ["---", f"（本文件由 TripCraft 交付物工作台生成 · {spec.filename}）"]
+    # 页脚面向学员：不再暴露内部文件名（旧版会写「需求确认单.md」这类实现细节，R05/文案审查）
+    out += ["---", "（本文件由 TripCraft · 旅鸢 交付物工作台生成，可在工作台下载 PDF 留存）"]
     return "\n".join(out)
+
+
+def render_for_customer(spec: DeliverableSpec, values: dict[str, Any],
+                        context: dict[str, Any] | None = None) -> tuple[str, list[str]]:
+    """客户输出的渲染结果 + 被剔除的内部口径词（供工作台提示学员）。
+
+    withheld 只统计**客户可见字段**里出现过的内部口径词（内部字段本身不算，
+    否则任何报价单都会因为存在「成本」字段而误报）。
+    """
+    text = render(spec, values, context, audience="customer")
+    seen: list[str] = []
+    for f in spec.fields:
+        if f.internal:
+            continue
+        raw = values.get(f.key)
+        chunks: list[str] = []
+        if isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, dict):
+                    chunks.extend(str(v) for v in item.values())
+                else:
+                    chunks.append(str(item))
+        elif raw not in (None, ""):
+            chunks.append(str(raw))
+        blob = "\n".join(chunks)
+        seen.extend(t for t in CUSTOMER_LEAK_TERMS if t in blob)
+    return text, sorted(set(seen))
 
 
 def _quote_summary(values: dict[str, Any]) -> list[str]:

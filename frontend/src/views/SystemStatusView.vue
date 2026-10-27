@@ -1,5 +1,32 @@
 <template>
   <div class="sys">
+    <section class="card sec">
+      <div class="sec-title title-rule"><span>订单客户事实卡</span></div>
+      <div class="row">
+        <select v-model="factOrderId" class="ipt" style="max-width:420px" @change="loadCustomerCard">
+          <option value="" disabled hidden>请选择订单</option>
+          <option v-for="o in factOrders" :key="o.order_id" :value="o.order_id">{{ o.customer }} · {{ o.destination }} · {{ o.order_id }}</option>
+        </select>
+        <button class="tc-btn ghost" :disabled="!factOrderId || factLoading" @click="loadCustomerCard">{{ factLoading ? '读取中…' : '查看事实卡' }}</button>
+      </div>
+      <p v-if="factError">{{ factError }}</p>
+      <template v-if="factData">
+        <div class="sec-sub">{{ factData.card.identity.customer }} · {{ factData.card.identity.language }} · 版本 {{ factData.card.version }}</div>
+        <table class="tbl">
+          <thead><tr><th>字段</th><th>客户答案</th><th>状态</th><th>已告知</th></tr></thead>
+          <tbody><tr v-for="(f, key) in factData.card.fields" :key="key">
+            <td>{{ FACT_LABELS[key] || key }}</td><td>{{ f.value || '尚未确定' }}</td>
+            <td>{{ FACT_STATES[f.state] || f.state }}</td><td>{{ f.revealed ? '是' : '否' }}</td>
+          </tr></tbody>
+        </table>
+        <details v-if="factData.conflicts.length">
+          <summary>被拦截的冲突（{{ factData.conflicts.length }}）</summary>
+          <table class="tbl"><thead><tr><th>字段</th><th>候选值</th><th>规范值</th><th>通道</th></tr></thead>
+            <tbody><tr v-for="e in factData.conflicts" :key="e.event_id"><td>{{ FACT_LABELS[e.fact_key] || e.fact_key }}</td><td>{{ e.value }}</td><td>{{ e.expected || '未定' }}</td><td>{{ e.source_channel }}</td></tr></tbody>
+          </table>
+        </details>
+      </template>
+    </section>
     <!-- ① 导演规则表（只读） -->
     <section class="card sec">
       <div class="sec-title title-rule"><span>导演规则表 · 按 13 步注入事件型考点</span></div>
@@ -119,6 +146,23 @@ import client from '@/api/client'
 
 const KINDS = ['地接社', '酒店', '车队', '票务']
 const AVAILABILITY = ['有货', '紧张', '无货', '无档期']
+const FACT_LABELS: Record<string, string> = { party: '人数', dates: '日期', days: '天数', budget: '预算', transport: '交通', hotel: '住宿', special: '特殊需求', decision: '决策人', documents: '证件' }
+const FACT_STATES: Record<string, string> = { fixed: '明确事实', canonical_hidden: '确定但尚未主动告知', unknown: '尚未确定' }
+const factOrders = ref<any[]>([])
+const factOrderId = ref('')
+const factData = ref<any>(null)
+const factError = ref('')
+const factLoading = ref(false)
+async function loadFactOrders() {
+  try { const data = (await client.get('/practice/orders')).data; factOrders.value = (Array.isArray(data) ? data : data.orders || []).filter((o: any) => o.claimed === true) } catch { factError.value = '订单读取失败' }
+}
+async function loadCustomerCard() {
+  if (!factOrderId.value) return
+  factLoading.value = true; factError.value = ''; factData.value = null
+  try { factData.value = (await client.get(`/practice/orders/${encodeURIComponent(factOrderId.value)}/customer-card`)).data }
+  catch { factError.value = '事实卡读取失败' }
+  finally { factLoading.value = false }
+}
 
 const rules = ref<any[]>([])
 const cal = ref<any>({ samples: 0, latest: null, gate: null })
@@ -172,7 +216,7 @@ async function runCalibration(repeats: number) {
   } finally { calRunning.value = false }
 }
 
-onMounted(() => { loadRules(); loadCalibration(); loadMcp(); loadStates() })
+onMounted(() => { loadRules(); loadCalibration(); loadMcp(); loadStates(); loadFactOrders() })
 </script>
 
 <style scoped lang="scss">

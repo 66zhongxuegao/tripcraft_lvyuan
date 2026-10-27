@@ -51,8 +51,11 @@
         <div class="mh-l">
           <span class="mh-name">{{ active.name }}</span>
           <span class="mh-kind">{{ active.kind }}</span>
+          <span class="mh-type">{{ conversationTypeLabel }}</span>
           <span class="mh-members" @click="infoOpen = !infoOpen">{{ active.members.length }} 位成员</span>
-          <span v-if="active.order_id" class="mh-order">订单 {{ active.order_id.slice(-4) }}</span>
+          <span v-if="active.order_id" class="mh-order link" @click="openOrder(active.order_id)">
+            订单 {{ active.order_id }}
+          </span>
         </div>
         <div class="mh-r">
           <button v-if="active.kind === '客户' && active.order_id" class="icon-btn" title="语音通话"
@@ -61,7 +64,7 @@
             :disabled="!active.session_id" @click="renameOrRemark">
             <SIcon name="filetext" :size="13" />
           </button>
-          <button class="icon-btn" title="邀请成员" :disabled="!active.session_id" @click="openInvite">
+          <button v-if="active.code !== 'ticket'" class="icon-btn" title="邀请成员" :disabled="!active.session_id" @click="openInvite">
             <SIcon name="plus" :size="13" />
           </button>
         </div>
@@ -148,7 +151,30 @@
       </div>
 
       <div class="input">
+        <div v-if="active.conversation_type === 'hub'" class="target-row">
+          <span class="target-label">订单</span>
+          <select v-model="currentOrderId" class="target-select">
+            <option v-for="o in orders" :key="o.order_id" :value="o.order_id">
+              {{ o.order_id }} · {{ o.customer }} · {{ o.destination }}
+            </option>
+            <option v-if="!orders.length" value="">暂无订单</option>
+          </select>
+        </div>
+        <div v-if="active.conversation_type === 'hub' || active.conversation_type === 'group'" class="target-row">
+          <span class="target-label">本次找</span>
+          <select v-model="targetRole" class="target-select">
+            <option value="">自动判断</option>
+            <option value="地接社">地接社</option>
+            <option value="酒店">酒店</option>
+            <option value="车队">车队</option>
+            <option value="导游">司导档期（地接统筹）</option>
+          </select>
+        </div>
         <div class="tools">
+          <button class="tool voice-tool" :class="{ on: voiceListening }"
+            :disabled="!canSend" @click="toggleVoiceInput">
+            <SIcon name="mic" :size="13" />{{ voiceProcessing ? '识别中…' : voiceListening ? '结束语音' : '语音输入' }}
+          </button>
           <button class="tool" :disabled="!canSend" @click="sendMenu = !sendMenu">
             <SIcon name="plus" :size="13" />发送
           </button>
@@ -163,7 +189,7 @@
           <input ref="fileInput" type="file" class="hidden-file" @change="onPickFile" />
         </div>
         <textarea v-model="draft" class="ipt" rows="2"
-          :placeholder="canSend ? '在群里发消息…（Enter 发送，Shift+Enter 换行）' : '还不能在这里发言'"
+          :placeholder="canSend ? '在群里发消息…（Enter 发送，Shift+Enter 换行）' : (active.conversation_type === 'hub' && !orderForSend ? '请先选择订单' : '还不能在这里发言')"
           :disabled="!canSend" @keydown.enter.exact.prevent="send" />
         <button class="tc-btn send" :disabled="!canSend" @click="send">
           <SIcon name="right" :size="13" /> 发送
@@ -294,15 +320,27 @@ const rooms = ref<any[]>([])
 const contacts = ref<any[]>([])          // 还能加谁（按最近在跟的一单给的目录）
 const mine = ref<any[]>([])              // 我的通讯录（跨订单只有一份）
 const groupOrderId = ref('')
+const orders = ref<any[]>([])
+const currentOrderId = ref('')
 const sendMenu = ref(false)
 const fileInput = ref<HTMLInputElement | null>(null)
 const activeId = ref('')
 const draft = ref('')
+const targetRole = ref('')
 const replying = ref(false)
 const reacted = ref<string[]>([])
 const notice = ref('')
 const busy = ref(false)
 const infoOpen = ref(true)
+const voiceListening = ref(false)
+const voiceProcessing = ref(false)
+let voiceWs: WebSocket | null = null
+let voiceStream: MediaStream | null = null
+let voiceCtx: AudioContext | null = null
+let voiceProc: ScriptProcessorNode | null = null
+let voiceBase = ''
+let voiceFinal = ''
+let voiceResetTimer = 0
 
 const newGroupDlg = ref(false)
 const groupName = ref('')
@@ -324,14 +362,25 @@ const BLANK = { session_id: '', name: '未选择会话', kind: '', members: [], 
 const sessions = computed(() => rooms.value)
 const pendingContacts = computed(() => contacts.value.filter((c) => c.available && !c.added))
 const active = computed<any>(() => rooms.value.find((r) => r.session_id === activeId.value) || BLANK)
+const conversationTypeLabel = computed(() => {
+  if (active.value.code === 'ticket') return '固定窗口'
+  const t = active.value.conversation_type
+  if (t === 'hub') return '资源协作群'
+  if (t === 'dm') return '单聊'
+  if (t === 'group') return '群聊'
+  return '会话'
+})
+const orderForSend = computed(() => active.value.order_id || currentOrderId.value || practice.activeOrderId || '')
 const addedContacts = computed(() => mine.value)
 const openContacts = computed(() => contacts.value.filter((c) => c.available && !c.added))
 const lockedContacts = computed(() => contacts.value.filter((c) => !c.available && !c.added))
 const canSend = computed(() => !!active.value.session_id && active.value.present
-  && !active.value.locked && !replying.value)
+  && !active.value.locked && !replying.value
+  && (active.value.conversation_type !== 'hub' || !!orderForSend.value))
 const lockTarget = computed(() => openContacts.value.find((c) => c.kind === active.value.require_contact))
-const invitable = computed(() => addedContacts.value
-  .filter((c) => !(active.value.members || []).includes(c.name)))
+const invitable = computed(() => active.value.code === 'ticket' ? [] : addedContacts.value
+  .filter((c) => !(active.value.members || []).includes(c.name))
+  .filter((c) => !(active.value.conversation_type === 'hub' && c.kind === '客户')))
 
 const PALETTE = ['#2577e3', '#12a76a', '#7a5af8', '#e08a1e', '#e0567a', '#0ea5b7']
 function avatarColor(key: string) {
@@ -364,37 +413,69 @@ function parseRooms(list: any[]) {
   }))
 }
 
+let lastQuerySession = ''
 async function loadRooms() {
   try {
-    // 真实场景里会话是混在一起的：不带 order_id，后端返回所有订单的会话
-    const r = (await client.get('/practice/im/sessions')).data
+    // 资源群按当前订单创建；单聊和自建群仍像真实聊天软件一样混排。
+    const oid = currentOrderId.value || practice.activeOrderId || ''
+    const want = String(route.query.session || '')
+    // 深链参数只在它真正变化时应用一次。不能每次轮询都强制切回 want，
+    // 否则用户手动选择另一个会话后，15 秒轮询会把人拽回原窗口。
+    const queryChanged = want !== lastQuerySession
+    lastQuerySession = want
+    const r = (await client.get('/practice/im/sessions',
+      { params: { order_id: oid, session: want } })).data
     rooms.value = parseRooms(r)
-    if (!rooms.value.some((g) => g.session_id === activeId.value)) {
+    const target = queryChanged && want ? rooms.value.find((g) => g.session_id === want) : null
+    if (target) {
+      activeId.value = target.session_id
+      if (target.order_id && currentOrderId.value !== target.order_id) {
+        currentOrderId.value = target.order_id
+      }
+    } else if (!rooms.value.some((g) => g.session_id === activeId.value)) {
       activeId.value = (rooms.value.find((g) => g.present && !g.locked) || rooms.value[0] || {}).session_id || ''
     }
     if (activeId.value) markSeen(activeId.value)
   } catch { rooms.value = [] }
 }
 
+async function loadContactCatalog(oid: string) {
+  if (!oid) { contacts.value = []; mine.value = []; return }
+  const r = (await client.get('/practice/im/contacts', { params: { order_id: oid } })).data
+  contacts.value = (r.contacts || []).map((c: any) => ({ ...c, order_id: oid }))
+  mine.value = r.mine || []
+}
+
 async function loadContacts() {
   try {
-    // 目录按"最近在跟的一单"给（谁的电话能加是跟着订单走的）
-    const orders = (await client.get('/practice/orders')).data || []
-    const oid = (orders.find((o: any) => o.stage_index < 7) || orders[0] || {}).order_id || ''
+    const list = (await client.get('/practice/orders')).data || []
+    orders.value = list
+    const wantedOrder = String(route.query.order || '')
+    const oid = (list.find((o: any) => o.order_id === wantedOrder)
+      || list.find((o: any) => o.order_id === currentOrderId.value)
+      || list.find((o: any) => o.order_id === practice.activeOrderId)
+      || list.find((o: any) => o.stage_index < 7) || list[0] || {}).order_id || ''
+    const before = currentOrderId.value
+    currentOrderId.value = oid
     groupOrderId.value = oid
-    const r = (await client.get('/practice/im/contacts', { params: { order_id: oid } })).data
-    contacts.value = (r.contacts || []).map((c: any) => ({ ...c, order_id: oid }))
-    mine.value = r.mine || []
+    if (before === oid) await loadContactCatalog(oid)
   } catch {
+    orders.value = []
     contacts.value = []
     mine.value = []
   }
 }
 
+watch(currentOrderId, async (oid) => {
+  if (!oid) return
+  groupOrderId.value = oid
+  try { await loadContactCatalog(oid) } catch { contacts.value = [] }
+  await loadRooms()
+})
 async function reload() {
   notice.value = ''
-  await loadRooms()
   await loadContacts()
+  await loadRooms()
 }
 
 async function addContact(c: any) {
@@ -404,6 +485,11 @@ async function addContact(c: any) {
     const r = (await client.post('/practice/im/contacts',
       { order_id: c.order_id, kind: c.kind })).data
     await reload()
+    if (c.kind === '客户') {
+      await router.push({ path: '/practice/orders/' + c.order_id + '/deliverables',
+                          query: { code: 'requirement_sheet' } })
+      return
+    }
     activeId.value = r.session_id
     notice.value = `已添加「${c.name}」，可以单聊或拉进群了`
   } catch (e: any) {
@@ -461,14 +547,144 @@ const msgsEl = ref<HTMLElement | null>(null)
 function scrollMsgsToEnd() {
   nextTick(() => { const el = msgsEl.value; if (el) el.scrollTop = el.scrollHeight })
 }
+function openOrder(orderId: string) {
+  if (orderId) router.push(`/practice/orders/${orderId}`)
+}
 function openSession(sid: string) {
+  if (voiceListening.value || voiceProcessing.value) stopVoiceInput()
   activeId.value = sid
+  targetRole.value = ''
   notice.value = ''
   markSeen(sid)
   scrollMsgsToEnd()
 }
 
+const VOICE_LANGS: Record<string, string> = {
+  '中文': 'zh-CN', English: 'en-US', 日本語: 'ja-JP', 한국어: 'ko-KR',
+  Français: 'fr-FR', Deutsch: 'de-DE', Español: 'es-ES', Русский: 'ru-RU',
+  Italiano: 'it-IT', Português: 'pt-PT', 'Tiếng Việt': 'vi-VN',
+  'Bahasa Indonesia': 'id-ID', ไทย: 'th-TH', Türkçe: 'tr-TR',
+}
+
+function attachVoiceTranscript(text: string) {
+  const piece = String(text || '').trim()
+  if (!piece) return
+  voiceFinal = [voiceFinal, piece].filter(Boolean).join(' ')
+  draft.value = [voiceBase, voiceFinal].filter(Boolean).join(' ')
+}
+
+function stopVoiceMic() {
+  try { voiceProc?.disconnect() } catch { /* ignore */ }
+  voiceStream?.getTracks().forEach((track) => track.stop())
+  try { voiceCtx?.close() } catch { /* ignore */ }
+  voiceProc = null
+  voiceStream = null
+  voiceCtx = null
+}
+
+function resetVoiceInput(delay = 0) {
+  if (voiceResetTimer) window.clearTimeout(voiceResetTimer)
+  voiceResetTimer = window.setTimeout(() => {
+    stopVoiceMic()
+    try { voiceWs?.close() } catch { /* ignore */ }
+    voiceWs = null
+    voiceListening.value = false
+    voiceProcessing.value = false
+  }, delay)
+}
+
+async function startVoiceMic() {
+  try {
+    voiceStream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    })
+    voiceCtx = new AudioContext({ sampleRate: 16000 })
+    const source = voiceCtx.createMediaStreamSource(voiceStream)
+    voiceProc = voiceCtx.createScriptProcessor(2048, 1, 1)
+    const mute = voiceCtx.createGain()
+    mute.gain.value = 0
+    voiceProc.onaudioprocess = (event) => {
+      if (!voiceWs || voiceWs.readyState !== WebSocket.OPEN) return
+      const input = event.inputBuffer.getChannelData(0)
+      const pcm = new Int16Array(input.length)
+      for (let i = 0; i < input.length; i++) {
+        const value = Math.max(-1, Math.min(1, input[i]))
+        pcm[i] = value < 0 ? value * 0x8000 : value * 0x7fff
+      }
+      let binary = ''
+      const bytes = new Uint8Array(pcm.buffer)
+      for (let i = 0; i < bytes.length; i += 0x8000) {
+        binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + 0x8000)) as number[])
+      }
+      voiceWs.send(JSON.stringify({ type: 'audio', audio: btoa(binary) }))
+    }
+    source.connect(voiceProc)
+    voiceProc.connect(mute)
+    mute.connect(voiceCtx.destination)
+    voiceListening.value = true
+    voiceProcessing.value = false
+  } catch {
+    notice.value = '麦克风未授权或不可用，请检查权限'
+    resetVoiceInput()
+  }
+}
+
+function startVoiceInput() {
+  notice.value = ''
+  voiceBase = draft.value.trim()
+  voiceFinal = ''
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws'
+  const lang = VOICE_LANGS[String(active.value.language || '中文')] || 'zh-CN'
+  voiceWs = new WebSocket(proto + '://' + location.host + '/api/voice/dictation?lang=' + encodeURIComponent(lang))
+  voiceProcessing.value = true
+  voiceWs.onmessage = async (event) => {
+    let msg: any
+    try { msg = JSON.parse(event.data) } catch { return }
+    if (msg.type === 'ready') await startVoiceMic()
+    else if (msg.type === 'transcript') attachVoiceTranscript(msg.text)
+    else if (msg.type === 'error') {
+      notice.value = msg.message || '语音识别失败'
+      resetVoiceInput()
+    }
+  }
+  voiceWs.onerror = () => {
+    notice.value = '语音识别通道连接失败'
+    resetVoiceInput()
+  }
+  voiceWs.onclose = () => {
+    voiceListening.value = false
+    voiceProcessing.value = false
+    voiceWs = null
+  }
+}
+
+function stopVoiceInput() {
+  if (!voiceListening.value && !voiceProcessing.value) return
+  voiceListening.value = false
+  voiceProcessing.value = true
+  stopVoiceMic()
+  try {
+    if (voiceWs?.readyState === WebSocket.OPEN) voiceWs.send(JSON.stringify({ type: 'stop' }))
+  } catch { /* ignore */ }
+  resetVoiceInput(8000)
+}
+
+function toggleVoiceInput() {
+  if (voiceListening.value) { stopVoiceInput(); return }
+  if (voiceProcessing.value) {
+    try { voiceWs?.close() } catch { /* ignore */ }
+    resetVoiceInput()
+    return
+  }
+  startVoiceInput()
+}
+
 async function send() {
+  if (voiceListening.value) stopVoiceInput()
+  if (voiceProcessing.value) {
+    notice.value = '语音识别中，请稍等识别结果填入输入框'
+    return
+  }
   const t = draft.value.trim()
   if (!t || !canSend.value) return
   const sid = activeId.value
@@ -478,9 +694,11 @@ async function send() {
   try {
     const r = (await client.post(`/practice/im/sessions/${sid}/messages`,
       { sender: '我', role: 'me', content: t,
-        order_id: active.value.order_id || practice.activeOrderId || '' })).data
+        order_id: orderForSend.value,
+        target_role: targetRole.value })).data
     reacted.value = r.reacted || []
     await loadRooms()
+    await loadContacts()
     scrollMsgsToEnd()
     if (r.reply && r.reply.locked) notice.value = r.reply.content
   } catch (e: any) {
@@ -494,7 +712,8 @@ async function sendCard(payload: any) {
   busy.value = true
   try {
     await client.post(`/practice/im/sessions/${active.value.session_id}/messages`,
-      { sender: '我', role: 'me', content: `【${payload.title}】已发送`, kind: 'card', payload })
+      { sender: '我', role: 'me', content: `【${payload.title}】已发送`, kind: 'card', payload,
+        order_id: orderForSend.value, target_role: targetRole.value })
     await loadRooms()
   } catch (e: any) {
     notice.value = e?.response?.data?.detail || '发送失败'
@@ -544,11 +763,12 @@ async function onPickFile(ev: Event) {
     }
     const up = (await client.post('/deliverables/files', {
       filename: f.name, mime: f.type || 'application/octet-stream',
-      data_b64: btoa(bin), order_id: active.value.order_id || '',
+      data_b64: btoa(bin), order_id: orderForSend.value,
       deliverable_id: '',
     })).data
     await client.post(`/practice/im/sessions/${active.value.session_id}/messages`,
       { sender: '我', role: 'me', content: f.name, kind: 'file',
+        order_id: orderForSend.value, target_role: targetRole.value,
         payload: { filename: f.name, size: Math.max(1, Math.round(f.size / 1024)) + ' KB',
                    file_id: up.file_id } })
     await loadRooms()
@@ -649,9 +869,9 @@ onMounted(async () => {
   pickFromQuery()                       // 从「发送方案」跳过来时直接打开那位客户的会话
   poll = window.setInterval(loadRooms, 15000)
 })
-watch(() => route.query.session, pickFromQuery)
+watch(() => [route.query.session, route.query.order], () => { reload() })
 watch(() => [active.value.session_id, active.value.messages.length], () => scrollMsgsToEnd())
-onUnmounted(() => { if (poll) clearInterval(poll) })
+onUnmounted(() => { if (voiceListening.value || voiceProcessing.value) stopVoiceInput(); if (poll) clearInterval(poll) })
 </script>
 
 <style scoped lang="scss">
@@ -659,6 +879,8 @@ onUnmounted(() => { if (poll) clearInterval(poll) })
 
 .im { display: grid; grid-template-columns: 326px minmax(0, 1fr); gap: 12px; max-width: 1320px; align-items: start; }
 .im.wide { grid-template-columns: 326px minmax(0, 1fr) 268px; }
+.voice-tool.on { color: #fff; background: #e0567a; border-color: #e0567a; animation: voicePulse 1.1s ease-in-out infinite; }
+@keyframes voicePulse { 0%,100% { box-shadow: 0 0 0 0 rgba(224,86,122,.28); } 50% { box-shadow: 0 0 0 7px rgba(224,86,122,0); } }
 .col { display: flex; flex-direction: column; }
 .card { background: #fff; border: 1px solid $color-border; border-radius: $radius-md; box-shadow: $shadow-card; }
 
@@ -703,6 +925,13 @@ onUnmounted(() => { if (poll) clearInterval(poll) })
 .mh-l { display: flex; align-items: center; gap: 9px; min-width: 0; }
 .mh-name { font-size: 19px; font-weight: 700; }
 .mh-kind { font-size: 14.5px; color: $color-primary; background: $color-primary-soft; border-radius: 4px; padding: 1px 7px; }
+.mh-kind { font-size: 14.5px; color: $color-primary; background: $color-primary-soft; border-radius: 4px; padding: 1px 7px; }
+.mh-type { font-size: 13.5px; color: $color-text-secondary; background: #f1f5fa; border-radius: 4px; padding: 1px 7px; }
+.mh-order.link { cursor: pointer; color: $color-primary; text-decoration: underline; text-underline-offset: 3px; }
+.target-row { display: flex; align-items: center; gap: 9px; font-size: 14px; color: $color-text-secondary; }
+.target-label { flex: 0 0 auto; font-weight: 600; }
+.target-select { border: 1px solid $color-border; border-radius: 6px; padding: 5px 8px; font: inherit; color: $color-text; background: #fff; outline: none; }
+.target-select:focus { border-color: $color-primary; }
 .mh-members { font-size: 14.5px; color: $color-text-muted; cursor: pointer; }
 .mh-members:hover { color: $color-primary; }
 .mh-order { font-size: 14.5px; color: $color-text-muted; }

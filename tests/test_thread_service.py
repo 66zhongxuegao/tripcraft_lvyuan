@@ -33,6 +33,11 @@ def make():
     return ThreadService(store, FakeLLM()), store
 
 
+def tid(store, user_id: str, sp: str) -> str:
+    """线程 ID 现在按「用户 + 技能点」唯一（旧写法 `thread:<技能点>` 会跨账号串数据）。"""
+    return store.get_or_create_thread(user_id, sp)["thread_id"]
+
+
 def test_context_has_six_sources():
     svc, _ = make()
     ctx = svc.build_context("u1", "C2.2")
@@ -52,7 +57,7 @@ def test_reply_saves_message_and_evidence():
     r = svc.reply("u1", "C2.2", "预算这块怎么问？")
     assert "预算" in r["content"]
     assert r["evidence"], "回复必须带来源"
-    msgs = store.messages("thread:C2.2")
+    msgs = store.messages(tid(store, "u1", "C2.2"))
     assert [m["role"] for m in msgs] == ["user", "ai"]
 
 
@@ -123,7 +128,7 @@ def test_chat_routes_asset_and_saves_it():
     assert r["kind"] == "asset"
     assert r["asset"]["type"] == "lecture"
     assert store.assets("u1", "C2.2"), "生成的资源要进个性资源栏"
-    roles = [m["role"] for m in store.messages("thread:C2.2")]
+    roles = [m["role"] for m in store.messages(tid(store, "u1", "C2.2"))]
     assert roles == ["user", "ai"], "学员那句话也要留在会话里"
 
 
@@ -132,7 +137,7 @@ def test_chat_routes_quiz():
     r = svc.chat("u1", "C2.2", "出一道这个技能点的题给我练。")
     assert r["kind"] == "quiz"
     assert r["quiz"]["type"] == "choice"
-    assert [m["role"] for m in store.messages("thread:C2.2")] == ["user", "ai"]
+    assert [m["role"] for m in store.messages(tid(store, "u1", "C2.2"))] == ["user", "ai"]
 
 
 def test_chat_plain_question_stays_chat():
@@ -148,7 +153,7 @@ def test_quiz_is_stored_as_structured_message():
     svc, store = make()
     r = svc.chat("u1", "C2.2", "出一道题给我练。")
     assert r["kind"] == "quiz"
-    rows = store.messages("thread:C2.2")
+    rows = store.messages(tid(store, "u1", "C2.2"))
     kinds = [m["kind"] for m in rows]
     assert "quiz" in kinds, "题目要作为 kind=quiz 的消息落库"
     card = [m for m in rows if m["kind"] == "quiz"][-1]
@@ -159,7 +164,7 @@ def test_answer_result_is_attached_by_question_id():
     svc, store = make()
     q = svc.pick_question("u1", "C2.2")
     svc.submit_answer("u1", "C2.2", q, "B")
-    rows = store.messages("thread:C2.2")
+    rows = store.messages(tid(store, "u1", "C2.2"))
     res = [m for m in rows if m["kind"] == "quiz_result"]
     assert res, "判分结果要落库，否则刷新后题卡变回未作答"
     assert q["question_id"] in res[-1]["payload"]

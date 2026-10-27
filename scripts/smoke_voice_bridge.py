@@ -15,7 +15,7 @@ import sys
 
 import websockets
 
-BASE = "ws://127.0.0.1:18010/voice/realtime"
+BASE = "ws://127.0.0.1:18020/voice/realtime"
 
 
 async def main() -> int:
