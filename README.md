@@ -10,7 +10,7 @@
 > **本链接为临时演示链接**，维护时段可能短暂不可用；如打不开请稍后再试，以本节地址为准。
 
 <!-- LIVE-DEMO:START -->
-**https://filled-gage-determination-clients.trycloudflare.com**
+**[2026-10-27 22:56:50] started cloudflared pid=21764 attempt=1/5 [2026-10-27 22:56:56] tunnel URL: https://flag-western-ticket-cooperation.trycloudflare.com https://flag-western-ticket-cooperation.trycloudflare.com**
 <!-- LIVE-DEMO:END -->
 
 Chrome / Edge 打开即可，免安装、免注册。首次加载约 3–5 秒（演示隧道在境外中转），之后操作流畅。
