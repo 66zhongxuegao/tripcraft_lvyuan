@@ -254,6 +254,26 @@ def build(ctx: AppContext) -> APIRouter:
         own_order(ctx, user, order_id)
         return ctx.get_director().timeline(order_id)
 
+    # ---------------- 行中事件团队决策（十类角色并行评审 + 规则仲裁） ----------------
+
+    @router.post("/practice/orders/{order_id}/incidents/{incident_id}/decision")
+    def incident_decision(order_id: str, incident_id: str, body: S.IncidentDecisionBody,
+                          user: str = Depends(current_user)):
+        """对一条行中事件处置方案做团队决策；订单不存在 404，事件不存在 400。"""
+        own_order(ctx, user, order_id)
+        try:
+            return ctx.get_team_decision().decide(order_id, incident_id, body.plan)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+
+    @router.get("/practice/orders/{order_id}/incidents/{incident_id}/decision")
+    def incident_decision_get(order_id: str, incident_id: str,
+                              user: str = Depends(current_user)):
+        """最近一次团队决策（team_decision 事件 payload）；没有则 {"decision": null}。"""
+        own_order(ctx, user, order_id)
+        decision = ctx.get_team_decision().latest_decision(order_id, incident_id)
+        return decision if decision else {"decision": None}
+
     @router.get("/practice/orders/{order_id}/coverage")
     def practice_coverage(order_id: str, user: str = Depends(current_user)):
         own_order(ctx, user, order_id)

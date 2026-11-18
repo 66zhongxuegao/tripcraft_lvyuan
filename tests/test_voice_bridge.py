@@ -109,3 +109,55 @@ def test_trace_writes_ready_and_audio_counters(monkeypatch, tmp_path):
     assert rec["audio_in_frames"] == 12 and rec["audio_out_frames"] == 30
     assert rec["turns"] == 1 and rec["reason"] == "closed"
     assert rec["order_id"] == "9000000000000009"
+
+
+def test_pump_without_store_still_plays_transcript(tmp_path, monkeypatch):
+    """store 缺失时 _pump 只回放转写、不做事实卡校验。
+
+    真实链路里 store 由 call_svc/practice._store 派生，可能为空；单测也用
+    object.__new__ 建桥。没有 store 时不能抛 AttributeError，否则整轮语音断掉。
+    """
+    import asyncio
+
+    from tripcraft.voice import bridge as br
+
+    monkeypatch.setattr(br, "TRACE_FILE", tmp_path / "voice_trace.jsonl")
+
+    class _FakeWS:
+        def __init__(self):
+            self.sent = []
+
+        async def send_json(self, payload):
+            self.sent.append(payload)
+
+    b = object.__new__(VoiceBridge)
+    b.ws = _FakeWS()
+    b.lines = []
+    b.call_svc = None
+    b.session_id = "call-1"
+    b.order = {"order_id": "9000000000000009"}
+    b.customer_name = "客户 X"
+    b.practice = None
+    b.started_at = 0.0
+    b.ready_ok = False
+    b.ready_ms = None
+    b.audio_in_frames = 0
+    b.audio_in_bytes = 0
+    b.audio_out_frames = 0
+    b.audio_out_bytes = 0
+    b.store = None
+    b.client = None
+    b._trace = lambda reason: None
+
+    async def _run():
+        q = asyncio.Queue()
+        for ev in ({"type": "response.created"},
+                   {"type": "response.audio_transcript.done", "transcript": "喂，你好，我是陈先生。"},
+                   {"type": "response.done"}):
+            q.put_nowait(ev)
+        q.put_nowait(None)
+        await b._pump(q)
+
+    asyncio.run(_run())
+    assert b.lines == [{"who": "agent", "text": "喂，你好，我是陈先生。"}]
+    assert any(m.get("type") == "transcript" and m.get("who") == "agent" for m in b.ws.sent)

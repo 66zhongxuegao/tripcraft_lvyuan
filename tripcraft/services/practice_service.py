@@ -399,7 +399,12 @@ class PracticeService:
         return info
 
     def list_orders(self, user_id: str, mine_only: bool = True) -> list[dict]:
-        """订单管理只展示本人成功抢到的订单，各阶段与取消状态均遵守同一规则。"""
+        """订单管理只展示本人成功抢到的订单，各阶段与取消状态均遵守同一规则。
+
+        种子补齐的 `grab`（payload.backfill）只对**阶段 0 的候选单**不算接单；
+        已经在阶段 N>0 的演示单说明是学员跟到现在的单，仍应出现在订单管理里
+        （否则演示库的 5 张已推进订单全被隐藏，13 步流程没法演示）。
+        """
         out = []
         for o in self._store.orders(user_id):
             claimed = False
@@ -407,14 +412,17 @@ class PracticeService:
                 if action["action"] != "grab":
                     continue
                 evidence = json.loads(action.get("payload") or "{}")
-                # 演示种子补齐的流程动作不代表学员在抢单页成功接单。
-                if not isinstance(evidence, dict) or evidence.get("backfill"):
+                if not isinstance(evidence, dict):
+                    evidence = {}
+                # 演示种子补齐的流程动作不代表学员在抢单页成功接单：仅阶段 0 候选单按此处理。
+                if evidence.get("backfill") and int(o["stage_index"] or 0) == 0:
                     continue
                 if evidence.get("by") not in (None, "", user_id):
                     continue
                 claimed = True
                 break
-            if mine_only and not claimed:
+            # 取消/禁用的历史单仍归本人（订单管理要能翻到）；阶段 0 未接的派单归消息中心。
+            if mine_only and not claimed and o["status"] != "禁用":
                 continue
             item = self._to_order(o)
             item["claimed"] = claimed

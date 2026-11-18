@@ -270,6 +270,11 @@ def facts_from_order_row(row: dict | None) -> CustomerFacts:
     payload.update(card.get("identity") or {})
     payload.update({key: value["value"] if value["state"] != "unknown" else ""
                     for key, value in card["fields"].items()})
+    # 卡片只承载「客户心里有数但还没主动说」的事实；已固定/未知的事实
+    # customer_facts_block 已能按“已填/订单里没有明确的信息”表达。卡里没有隐藏
+    # 事实时不给 persona 挂卡，避免缺省事实被渲染成卡片清单而丢掉「没有」口径。
+    has_hidden = any(value.get("state") == "canonical_hidden"
+                     for value in card["fields"].values())
     # 只有真正派生时才需要 agents 包；放函数内避免模块级依赖
     from ..agents.customer import stable_gender_age
 
@@ -288,7 +293,7 @@ def facts_from_order_row(row: dict | None) -> CustomerFacts:
         gender=_s(payload.get("gender")) or gender,
         trip_facts={k: _s(payload.get(k)) for k in FACT_FIELDS},
         payload=payload,
-        customer_card=card,
+        customer_card=card if has_hidden else {},
         original_payload=original_payload,
     )
 

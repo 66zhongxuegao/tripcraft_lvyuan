@@ -9,12 +9,18 @@
   蓝帽 质量总控 —— 综合前五帽，给最终「合格 / 需修改」判定
 
 白帽/黑帽是硬门槛：任一不通过 → 材料需重写。
+
+执行方式：六顶帽子是六个独立 Agent（`review.white` … `review.red`），
+由 Conductor 按依赖分层调度——五顶互不依赖的帽子同批并行，蓝帽在五顶
+全部落黑板后才开跑（`depends_on=("white","black","green","yellow","red")`）。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 
+from ..orchestration import AgentRegistry, AgentResult, AgentTask, Blackboard, Conductor, Plan
 from .llm import DeepSeekClient
 
 WHITE_SYSTEM = """你是六帽审查中的白帽事实核查员。
@@ -49,6 +55,10 @@ BLUE_SYSTEM = """你是六帽审查中的蓝帽总控。
 - 其余帽子是「建议改进/需调整」→ 可判定「合格」但要在 note 里提醒。
 只输出 JSON：{"verdict":"合格 或 需修改","note":"一句话综合意见"}"""
 
+# 五顶并行帽子（蓝帽之外的声部）；白/黑是硬门槛。
+HAT_IDS = ("white", "black", "green", "yellow", "red")
+BLUE_ID = "blue"
+
 
 @dataclass
 class HatResult:
@@ -56,6 +66,10 @@ class HatResult:
     name: str
     verdict: str
     note: str
+
+
+def _hat_dict(hat: HatResult) -> dict:
+    return {"id": hat.id, "name": hat.name, "verdict": hat.verdict, "note": hat.note}
 
 
 class SixHatsReview:
@@ -67,27 +81,92 @@ class SixHatsReview:
         ("red", "红帽·个性适配", RED_SYSTEM),
         ("blue", "蓝帽·质量总控", BLUE_SYSTEM),
     ]
+    _NAMES = {hid: name for hid, name, _system in HATS}
 
-    def __init__(self, llm: DeepSeekClient) -> None:
+    def __init__(self, llm: DeepSeekClient, max_workers: int = 6) -> None:
         self._llm = llm
+        # 六帽是一支独立团队：自己的 Conductor + Registry，不复用教学流水线的黑板。
+        self._conductor = Conductor(AgentRegistry(), max_workers=max_workers)
+        self._bind_agents()
+
+    # ---------- 团队计划 ----------
+
+    @classmethod
+    def plan(cls) -> Plan:
+        """五个帽子 role 任务（无依赖 → 同批并行）+ 蓝帽（等五帽落黑板）。
+
+        任务设为 optional：任何一顶帽子异常都不能把整条审查打崩；
+        蓝帽按黑板上的实际结果拼 digest，缺项按「通过」降级。
+        """
+        tasks = [
+            AgentTask(hid, f"review.{hid}", "review", optional=True)
+            for hid, _name, _system in cls.HATS[:-1]
+        ]
+        tasks.append(AgentTask(BLUE_ID, "review.blue", "arbitrate",
+                               depends_on=tuple(HAT_IDS), optional=True))
+        return Plan("review.six_hats", "review", tuple(tasks))
+
+    def _bind_agents(self) -> None:
+        for hid, name, system in self.HATS[:-1]:
+            self._conductor.registry.bind(
+                f"review.{hid}", partial(self._agent_hat, hid, name, system))
+        self._conductor.registry.bind("review.blue", self._agent_blue)
+
+    # ---------- 帽子 Agent ----------
+
+    def _agent_hat(self, hid: str, name: str, system: str,
+                   task: AgentTask, board: Blackboard) -> AgentResult:
+        hat = self._run(hid, name, system,
+                        str(board.get("content") or ""),
+                        str(board.get("context_text") or ""))
+        return AgentResult(task.id, task.agent, output=_hat_dict(hat))
+
+    def _agent_blue(self, task: AgentTask, board: Blackboard) -> AgentResult:
+        prior = [board.get(hid) or {} for hid in HAT_IDS]
+        digest = "\n".join(
+            f"- {self._NAMES[hid]}：{p.get('verdict') or '通过'}，{p.get('note') or ''}"
+            for hid, p in zip(HAT_IDS, prior))
+        system = BLUE_SYSTEM + f"\n\n前五帽结论：\n{digest}"
+        hat = self._run(BLUE_ID, self._NAMES[BLUE_ID], system,
+                        str(board.get("content") or ""),
+                        str(board.get("context_text") or ""))
+        return AgentResult(task.id, task.agent, output=_hat_dict(hat))
+
+    # ---------- 审查 ----------
 
     def review(self, content: str, context_text: str) -> dict:
-        prior: dict[str, HatResult] = {}
-        for hid, name, system in self.HATS[:-1]:
-            prior[hid] = self._run(hid, name, system, content, context_text)
-
-        # 蓝帽综合前五帽
-        digest = "\n".join(f"- {r.name}：{r.verdict}，{r.note}" for r in prior.values())
-        blue_system = BLUE_SYSTEM + f"\n\n前五帽结论：\n{digest}"
-        blue = self._run("blue", "蓝帽·质量总控", blue_system, content, context_text)
-
-        hats = [prior[h] for h in ("white", "black", "green", "yellow", "red")] + [blue]
-        critical_fail = any(r.verdict == "不通过" for r in (prior["white"], prior["black"]))
-        final_verdict = blue.verdict if blue.verdict in ("合格", "需修改") else ("需修改" if critical_fail else "合格")
+        board = Blackboard({"content": content, "context_text": context_text})
+        result = self._conductor.run(self.plan(), board)
+        hats = [self._hat_output(hid, result.outputs.get(hid))
+                for hid, _name, _system in self.HATS]
+        by_id = {h["id"]: h for h in hats}
+        critical_fail = any(by_id[hid]["verdict"] == "不通过" for hid in ("white", "black"))
+        # 硬门槛：白/黑任一不通过 → 必须「需修改」，蓝帽说合格也不能翻案。
+        if critical_fail:
+            final_verdict = "需修改"
+        else:
+            final_verdict = by_id["blue"]["verdict"] if by_id["blue"]["verdict"] in ("合格", "需修改") else "合格"
         return {
             "verdict": final_verdict,
             "critical_fail": critical_fail,
-            "hats": [{"id": h.id, "name": h.name, "verdict": h.verdict, "note": h.note} for h in hats],
+            "hats": hats,
+            "orchestra": {
+                "run_id": result.run_id,
+                "trace": result.trace_dicts(),
+                "batches": result.batches,
+                "parallel": True,
+            },
+            "parallel": True,
+        }
+
+    def _hat_output(self, hid: str, out: object) -> dict:
+        """把黑板上的帽子输出规范化；缺失/坏数据按旧行为降级为「通过」。"""
+        data = out if isinstance(out, dict) else {}
+        return {
+            "id": hid,
+            "name": self._NAMES[hid],
+            "verdict": str(data.get("verdict") or "通过"),
+            "note": str(data.get("note") or ""),
         }
 
     def _run(self, hid: str, name: str, system: str, content: str, context_text: str) -> HatResult:
@@ -96,8 +175,11 @@ class SixHatsReview:
             data = self._llm.chat_json(
                 [{"role": "system", "content": system}, {"role": "user", "content": user}],
                 temperature=0.1, max_tokens=200)
+            if not isinstance(data, dict):
+                data = {}
+            verdict = str(data.get("verdict") or "通过").strip()
+            note = str(data.get("note") or "").strip()
         except Exception:
-            data = {}
-        verdict = str(data.get("verdict") or "通过").strip()
-        note = str(data.get("note") or "").strip()
+            # 单顶帽子的调用/解析失败只降级这一顶，不击穿整条审查。
+            verdict, note = "通过", ""
         return HatResult(id=hid, name=name, verdict=verdict, note=note)

@@ -174,8 +174,8 @@ CONTACTS: tuple[ContactSpec, ...] = (
                 "客户需求确认后才把目的地地接联系方式给你"),
     ContactSpec("酒店", "地接确认本城需求后提供", "pool", "地接回答酒店需求后才给本城销售联系方式"),
     ContactSpec("车队", "地接确认本城需求后提供", "pool", "地接回答用车需求后才给本城车队联系方式"),
-    ContactSpec("导游", "地接确认本城需求后提供", "pool", "地接确认本城司导需求后才给导游联系方式"),
-    ContactSpec("司机", "地接确认本城需求后提供", "pool", "地接确认本城司导需求后才给司机联系方式"),
+    ContactSpec("导游", "地接确认本城需求后提供", "contact:地接社+stage:4", "行前地接排班后才给导游电话"),
+    ContactSpec("司机", "地接确认本城需求后提供", "contact:地接社+stage:4", "行前地接排班后才给司机电话"),
 )
 
 _SURNAMES = ("张", "李", "王", "陈", "刘", "周", "吴", "赵", "黄", "徐")
@@ -460,7 +460,7 @@ def build_quote(store, order_id: str, kind: str) -> dict:
         guide = round(base["guide_day"] * factor)
         ticket = round(base["ticket_avg"] * factor)
         items = [{"name": "住宿（四星含早）", "unit": "间/晚", "price": hotel}]
-        items += [{"name": name + "（含司机油费）", "unit": "天", "price": value}
+        items += [{"name": name + "（用车，含司机油费）", "unit": "天", "price": value}
                   for name, value in tiers.items()]
         items += [{"name": "导游", "unit": "天", "price": guide},
                   {"name": "门票（首道）", "unit": "人", "price": ticket}]
@@ -1261,6 +1261,11 @@ class SupplierService:
             name = contact.get("name") or ""
             display = self.display(contact)
             if name not in members and display not in members:
+                # 账号级资源群是兼容入口：本单资源在 ensure_hub(order_id) 时已入通讯录，
+                # 但账号级群的成员要按通讯录刷新一次，否则群里明明能问却报“还没加入”。
+                self.ensure_hub(user)
+                members = set(self._members(self._store.session(sess["session_id"]) or {}))
+            if name not in members and display not in members:
                 return {"sender": "系统", "role": "system",
                         "content": f"{who}还没有加入本单资源群，请先在通讯录添加后再问。"}
 
@@ -1416,7 +1421,7 @@ class SupplierService:
         ask = incidents[-1]["body"] if incidents else ""
         facts = "；".join(f"{i['title']}：{i['body']}" for i in incidents[-3:]) or "无"
         if self._llm is None:
-            text = GUIDE_TPL if ask else GUIDE_TPL_IDLE
+            text = f"{ask}\n{GUIDE_TPL}" if ask else GUIDE_TPL_IDLE
             return {"sender": self._speaker_of(sess, "行中"), "role": "other", "content": text,
                     "deferred": False}
         system = GUIDE_SYSTEM.format(

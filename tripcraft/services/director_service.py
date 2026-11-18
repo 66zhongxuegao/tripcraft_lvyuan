@@ -154,7 +154,7 @@ INCIDENT_RULES: tuple[dict[str, Any], ...] = (
                          "note": "已锁的四星酒店超售；同档次替代酒店离景区 20 分钟车程，贵 60 元/间/晚"}),
          cost={"code": "COST-HOTEL-OVERBOOK", "label": "替代酒店差价", "kind": "酒店",
                "amount_per": 60, "unit": "间晚"}),
-    rule("INC-VEHICLE-BREAKDOWN", "S10", ("depart",), "司导沟通群", "司机·赵师傅",
+    rule("INC-VEHICLE-BREAKDOWN", "S10", ("depart", "pre_trip"), "司导沟通群", "司机·赵师傅",
          "车辆故障",
          "车出问题了，早上怕是赶不上 8 点出发，我正在联系换车。客人那边您先帮我安抚一下，最快 7 点前给你们准信。",
          ("C6.1", "C6.2", "C6.3", "C6.5", "C6.7"), stage_min=4,

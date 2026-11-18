@@ -71,6 +71,18 @@ function firstOrderId(body) {
   return (row && row.order_id) || ''
 }
 
+/**
+ * 是否停在登录入口：新版前端把登录面板放在根路由，/login 会重定向成 /?mode=login，
+ * 所以不能再要求 href 严格等于 frontend + '/#/login'（旧口径在 0.2.0 路由下必假）。
+ */
+function atLoginRoute(href, frontend) {
+  const h = String(href || '')
+  const f = String(frontend || '')
+  if (!h || !f || !h.startsWith(f)) return false
+  const rest = h.slice(f.length)
+  return ['/#/', '/', '/#/?mode=login', '/?mode=login', '/#/login'].includes(rest)
+}
+
 async function runSelfcheck({ win, app, log, out, config }) {
   fs.mkdirSync(out, { recursive: true })
   await new Promise((r) => setTimeout(r, 2500))            // 等首屏（登录页）渲染完
@@ -123,7 +135,7 @@ async function runSelfcheck({ win, app, log, out, config }) {
   const base = {
     preloadDesktop: !!(ui.preload && ui.preload.desktop === true),
     uiLoaded: !!(ui.title && /^https?:/.test(ui.href || '')),
-    uiAtFrontendLogin: ui.href === config.frontend + '/#/login',
+    uiAtFrontendLogin: atLoginRoute(ui.href, config.frontend),
     // 公开登录界面不得出现标准案例入口（本轮口径：标准入口不展示给普通用户）
     loginPageHasNoStandardEntry: !/标准案例|标准案例演示/.test(bodyText),
   }
@@ -151,7 +163,7 @@ async function runSelfcheck({ win, app, log, out, config }) {
   } else {
     report.checks = {
       ...base,
-      uiAtDemoFrontend: ui.href === config.frontend + '/#/login',
+      uiAtDemoFrontend: atLoginRoute(ui.href, config.frontend),
       loginOk: ui.loginStatus === 200 && ui.tokenPresent === true,
       loginUser: ui.loginUser || '',
       loginUserIsDemo: ui.loginUser === DEMO_USER && !!ui.loginUserId,
@@ -164,17 +176,43 @@ async function runSelfcheck({ win, app, log, out, config }) {
     }
   }
 
+  // 截图：优先 capturePage；无 GPU/远程桌面会话下会抛 UnknownVizError，退到 CDP
+  // Page.captureScreenshot（同一渲染树，走调试协议取图），两者都不改变页面状态。
+  async function capturePng() {
+    try {
+      const image = await win.webContents.capturePage()
+      return { png: image.toPNG(), size: image.getSize(), method: 'capturePage' }
+    } catch (e) {
+      report.errors.push('capturePage: ' + String(e))
+    }
+    const dbg = win.webContents.debugger
+    try {
+      dbg.attach('1.3')
+      const shot = await dbg.sendCommand('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false })
+      dbg.detach()
+      if (shot && shot.data) {
+        const png = Buffer.from(shot.data, 'base64')
+        return { png, size: null, method: 'cdp' }
+      }
+    } catch (e) {
+      try { dbg.detach() } catch (e2) {}
+      report.errors.push('cdpScreenshot: ' + String(e))
+    }
+    return null
+  }
+
   try {
-    const image = await win.webContents.capturePage()
-    const png = image.toPNG()
-    const shot = path.join(out, `desktop-window-${Date.now()}.png`)
-    fs.writeFileSync(shot, png)
-    report.screenshot = {
-      path: shot, bytes: png.length, size: image.getSize(),
-      isPng: png.slice(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])),
+    const shot = await capturePng()
+    if (shot) {
+      const file = path.join(out, `desktop-window-${Date.now()}.png`)
+      fs.writeFileSync(file, shot.png)
+      report.screenshot = {
+        path: file, bytes: shot.png.length, size: shot.size, method: shot.method,
+        isPng: shot.png.slice(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])),
+      }
     }
   } catch (e) {
-    report.errors.push('capturePage: ' + String(e))
+    report.errors.push('screenshot: ' + String(e))
   }
 
   report.ok = Object.values(report.checks).every((v) => v === true || typeof v === 'string')

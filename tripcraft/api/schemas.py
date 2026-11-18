@@ -176,6 +176,10 @@ class DirectorEventBody(BaseModel):
     payload: dict = {}
 
 
+class IncidentDecisionBody(BaseModel):
+    plan: str = ""            # 行中事件处置方案；空 = 未填写具体方案
+
+
 class ReviewBody(BaseModel):
     decision: str = "accept"
     score: float | None = None

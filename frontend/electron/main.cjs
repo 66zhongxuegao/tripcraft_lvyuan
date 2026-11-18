@@ -31,6 +31,18 @@ const SELFCHECK_OUT = process.env.TRIPCRAFT_DESKTOP_SELFCHECK_OUT
 const FRONTEND = (process.env.TRIPCRAFT_FRONTEND_URL || 'http://127.0.0.1:5190').replace(/\/$/, '')
 const BACKEND = (process.env.TRIPCRAFT_BACKEND_URL || 'http://127.0.0.1:18020').replace(/\/$/, '')
 
+// 自检需要截图；无 GPU 会话（远程桌面/无显卡）下 capturePage 会抛 UnknownVizError。
+// 只在自检模式：关硬件加速 + 用 SwiftShader 软件渲染（取图走软件路径），正常窗口不受影响。
+if (SELFCHECK) {
+  try { app.disableHardwareAcceleration() } catch (e) {}
+  try {
+    app.commandLine.appendSwitch('use-angle', 'swiftshader')
+    app.commandLine.appendSwitch('use-gl', 'angle')
+    app.commandLine.appendSwitch('enable-unsafe-swiftshader')
+    app.commandLine.appendSwitch('disable-gpu-compositing')
+  } catch (e) {}
+}
+
 if (process.env.TRIPCRAFT_USER_DATA) {
   try { app.setPath('userData', process.env.TRIPCRAFT_USER_DATA) } catch (e) {}
 }
