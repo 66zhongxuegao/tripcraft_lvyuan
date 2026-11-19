@@ -508,9 +508,15 @@ class ThreadService:
                 tasks.append(AgentTask("profile", "teaching.profile", "advise",
                                        {"user_id": user_id, "sp": sp},
                                        depends_on=("context",), optional=True))
-            tasks.append(AgentTask("teacher", "teaching.teacher", "respond",
-                                   {"user_id": user_id, "sp": sp, "message": message},
-                                   depends_on=("context",)))
+                # 主讲要读画像建议：并行执行下必须显式依赖，不能靠「计划里的先后顺序」。
+                # profile 是可选声部，失败时主讲照常出稿（黑板取不到就不拼建议）。
+                tasks.append(AgentTask("teacher", "teaching.teacher", "respond",
+                                       {"user_id": user_id, "sp": sp, "message": message},
+                                       depends_on=("context", "profile")))
+            else:
+                tasks.append(AgentTask("teacher", "teaching.teacher", "respond",
+                                       {"user_id": user_id, "sp": sp, "message": message},
+                                       depends_on=("context",)))
             return Plan("teaching.reply", "teaching", tuple(tasks))
 
         result = self._conductor.run_dynamic(planner, build_plan, board)
@@ -563,7 +569,8 @@ class ThreadService:
         pipeline += [{"id": h["id"], "name": h["name"], "icon": HAT_ICON.get(h["id"], "circle")} for h in review["hats"]]
         return {"asset_id": aid, "type": kind, "title": ASSET_TYPES[kind], "content": content,
                 "evidence": sources, "review": {"verdict": review["verdict"], "regenerated": regenerated,
-                "hats": review["hats"]}, "pipeline": pipeline}
+                "hats": review["hats"], "orchestra": review.get("orchestra")},
+                "pipeline": pipeline}
 
     # ---------- 做题 ----------
 

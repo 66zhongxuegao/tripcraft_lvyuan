@@ -1,4 +1,13 @@
-"""认证与会话（API 边界层，Lead 冻结 v2）。
+"""认证与会话（API 边界层，Lead 冻结 v3）。
+
+v3 变更（SERVE_WEB 单端口部署的 `/api` 前缀）：
+  前端 axios 的 baseURL 固定为 `/api`（frontend/src/api/client.ts），vite 开发/预览
+  由代理 rewrite 掉该前缀；`SERVE_WEB=1` 单端口托管时没有这层代理，浏览器请求
+  `/api/auth/register`、WebSocket `/api/voice/realtime` 会因后端路由与白名单都没有
+  前缀而被认证中间件判成未知路径（401 / WS 无路由）。修法：仅当 `serve_web()` 为真
+  时，`ApiPrefixMiddleware` 在**路由匹配与鉴权之前**剥掉段边界开头的 `/api`；
+  未开 SERVE_WEB 时原样透传。前缀是路径改写，不是鉴权放宽
+  ——`/api/practice/orders` 未登录仍 401。
 
 v2 变更（监督者静态审查后收紧）：
   1. **删除 TRIPCRAFT_AUTH=off 身份直通旁路**。认证永远强制，生产、标准案例、
@@ -107,6 +116,53 @@ def _under(path: str, prefix: str) -> bool:
     if not p:
         return path == "/"
     return path == p or path.startswith(p + "/")
+
+
+# ---------------- SERVE_WEB 单端口部署的 `/api` 前缀 ----------------
+
+API_PREFIX = "/api"
+
+
+def strip_api_prefix(path: str) -> str:
+    """剥掉段边界开头的 `/api`：/api/auth/login → /auth/login；/api → /。
+
+    段边界匹配：`/apix`、`/apiary` 不动（否则会把无关路径改写成别的路由）。
+    """
+    if not _under(path, API_PREFIX):
+        return path
+    rest = path[len(API_PREFIX):]
+    return rest or "/"
+
+
+class ApiPrefixMiddleware:
+    """纯 ASGI 中间件：SERVE_WEB 时把浏览器带来的 `/api` 前缀在路由匹配前剥掉。
+
+    纯 ASGI（不是 BaseHTTPMiddleware）所以 **HTTP 与 WebSocket 一并覆盖**：
+    两个 scope 都在这里改写 `path`/`raw_path`，之后的路由匹配、认证中间件
+    （`request.url.path`）、静态产物白名单看到的都是无前缀路径。
+    未开 SERVE_WEB 时原样透传，开发环境仍由 vite 代理做 rewrite。
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") in ("http", "websocket") and serve_web():
+            scope = _strip_api_scope(scope)
+        await self.app(scope, receive, send)
+
+
+def _strip_api_scope(scope: dict) -> dict:
+    path = scope.get("path") or ""
+    new_path = strip_api_prefix(path)
+    if new_path == path:
+        return scope
+    scope = dict(scope)
+    scope["path"] = new_path
+    raw = scope.get("raw_path")
+    if isinstance(raw, bytes) and (raw == b"/api" or raw.startswith(b"/api/")):
+        scope["raw_path"] = raw[len(API_PREFIX):] or b"/"
+    return scope
 
 
 def is_public_api(path: str) -> bool:

@@ -18,7 +18,8 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 
-from ..contracts.enums import MasteryLevel, mastery_of
+from ..contracts.enums import DifficultyLevel, MasteryLevel, mastery_of
+from ..contracts.profile import AbilityProfile
 from ..contracts.skill_points import SKILL_POINTS, SKILL_POINTS_BY_ID
 
 # 一个旋钮由哪些维度拉动（PRD 20.4「维度 → 压力参数映射」）
@@ -43,15 +44,30 @@ KNOB_LABELS = {
 }
 
 # 档位 → 人话（给学员和评委看）
-LEVEL_WORDS = ("补救", "加压一档", "加压二档", "加压三档", "加压四档")
+LEVEL_WORDS = ("补救", "加压一档", "加压二档", "加压三档", "加压四档", "加压五档")
 
 TARGET_LIMIT = 3          # 一单主考的技能点数
+
+
+# 整单内部档位（0=补救，1..5=加压）→ 五层难度 L1..L5
+DIFFICULTY_LEVELS: tuple[DifficultyLevel, ...] = (
+    DifficultyLevel.L1,
+    DifficultyLevel.L2,
+    DifficultyLevel.L3,
+    DifficultyLevel.L4,
+    DifficultyLevel.L5,
+)
+
+
+def difficulty_of(level: int) -> DifficultyLevel:
+    """内部档位 → 五层难度：0=补救→L1，60-69→L2 … 90+→L5；越界一律钳位。"""
+    return DIFFICULTY_LEVELS[max(0, min(len(DIFFICULTY_LEVELS) - 1, int(level)))]
 
 
 @dataclass
 class LearnerBrief:
     user_id: str
-    level: int                                  # 0..4
+    level: int                                  # 0..5（0=补救；1..5=加压，5 仅满分量表顶）
     branch: str                                 # 补救 / 加压
     label: str                                  # 「补救 · L0」
     target_skill_points: tuple[str, ...]
@@ -64,9 +80,15 @@ class LearnerBrief:
 
     def to_dict(self) -> dict:
         d = asdict(self)
+        d["difficulty"] = self.difficulty.value
         d["knob_labels"] = {k: KNOB_LABELS[k] for k in self.knobs}
         d["knob_words"] = {k: LEVEL_WORDS[v] for k, v in self.knobs.items()}
         return d
+
+    @property
+    def difficulty(self) -> DifficultyLevel:
+        """整单五层难度（0=补救→L1；60-69→L2 … 90+→L5）。"""
+        return difficulty_of(self.level)
 
 
 def _mastery_of_point(row: dict | None) -> tuple[float, bool]:
@@ -90,8 +112,11 @@ def build_brief(abilities: dict[str, dict], carried_over: list[str] | None = Non
         value, evaluated = _mastery_of_point(abilities.get(sp.id))
         rows.append({"sp": sp, "value": value, "evaluated": evaluated})
 
-    # 目标技能点：未评估优先（还没考过），其次分数最低；同分按 ID 稳定排序
-    rows.sort(key=lambda r: (r["evaluated"], r["value"], r["sp"].id))
+    # 目标技能点：低分优先（未评估按 0 分，排最前）；同分按 ID 稳定排序，
+    # 排序口径统一走 contracts.profile.AbilityProfile.weak_top
+    ranked = AbilityProfile({r["sp"].id: r["value"] for r in rows}).weak_top(len(rows))
+    by_id = {r["sp"].id: r for r in rows}
+    rows = [by_id[sid] for sid in ranked]
 
     picked: list[dict] = []
     carry = list(carried_over or [])
@@ -112,7 +137,7 @@ def build_brief(abilities: dict[str, dict], carried_over: list[str] | None = Non
     if not picked or weakest < 60:
         level = 0
     else:
-        level = min(4, int((weakest - 60) // 10) + 1)   # 60-69→1 … 90+→4
+        level = min(5, int((weakest - 60) // 10) + 1)   # 60-69→1 … 90-99→4，100→5（L5 封顶）
     branch = "补救" if level == 0 else "加压"
 
     # 分旋钮取值：按维度分别算，取「最需要训练」的那一档

@@ -111,3 +111,68 @@ def test_duplicate_username_conflicts(client):
     assert first.status_code == 200
     second = client.post("/auth/register", json={"username": username, "password": DEFAULT_PASSWORD})
     assert second.status_code == 409
+
+
+# ======================================================================
+# SERVE_WEB 单端口部署：浏览器带 /api 前缀（前端 baseURL='/api'）
+#
+# 本地开发由 vite 代理 rewrite 掉 /api；单端口托管没有代理，必须由后端剥前缀。
+# 前缀是路径改写，不是鉴权放宽：未登录的 /api/practice/orders 仍 401。
+# ======================================================================
+
+def test_serve_web_strips_api_prefix_for_http_and_ws(monkeypatch):
+    """SERVE_WEB=1：/api/* 与 /* 等价（HTTP 与 WebSocket 都覆盖）。"""
+    from fastapi.testclient import TestClient
+    from starlette.websockets import WebSocketDisconnect
+
+    from tests.conftest import auth_headers, new_username, register_and_login
+    from tripcraft.api.app import create_app
+
+    monkeypatch.setenv("SERVE_WEB", "1")
+    c = TestClient(create_app())
+
+    # 根路径与静态托管照旧
+    assert c.get("/").status_code == 200
+    # 前端 axios 的 /api 前缀必须能命中后端路由
+    assert c.get("/api/auth/login-accounts").status_code == 200
+    assert c.get("/api/contracts/markets").status_code == 200
+    # 未登录的受保护接口仍 401（剥前缀不放宽鉴权）
+    assert c.get("/api/practice/orders").status_code == 401
+    # 无前缀路径在单端口模式下也照旧
+    assert c.get("/practice/orders").status_code == 401
+
+    # WebSocket 同样剥前缀：/api/voice/dictation 命中路由 → 无 token 时 4401 关闭。
+    # 必须在下面注册登录**之前**做，否则 client 的 cookie 已带 token，走的是另一分支。
+    with c.websocket_connect("/api/voice/dictation") as ws:
+        assert ws.receive_json()["type"] == "error"
+        with pytest.raises(WebSocketDisconnect) as closed:
+            ws.receive_json()
+    assert closed.value.code == 4401
+
+    # 带会话时 /api 前缀与无前缀等价
+    _username, user_id, token = register_and_login(c, new_username("apifix_"))
+    headers = auth_headers(token)
+    session = c.get("/api/auth/session", headers=headers)
+    assert session.status_code == 200 and session.json()["user_id"] == user_id
+    assert c.get("/api/practice/orders", headers=headers).status_code == 200
+
+
+def test_api_prefix_absent_when_serve_web_off(monkeypatch):
+    """未开 SERVE_WEB：/api/* 行为完全不变（无会话 401；有会话也 404 无此路由）。"""
+    from fastapi.testclient import TestClient
+
+    from tests.conftest import auth_headers, new_username, register_and_login
+    from tripcraft.api.app import create_app
+
+    monkeypatch.delenv("SERVE_WEB", raising=False)
+    c = TestClient(create_app())
+
+    assert c.get("/").status_code == 200
+    assert c.get("/auth/login-accounts").status_code == 200
+    assert c.get("/api/auth/login-accounts").status_code == 401
+    assert c.get("/api/practice/orders").status_code == 401
+
+    _username, _user_id, token = register_and_login(c, new_username("noapi_"))
+    # 前缀白名单也没有：认证过了也只能得到「路由不存在」
+    assert c.get("/api/contracts/markets", headers=auth_headers(token)).status_code == 404
+

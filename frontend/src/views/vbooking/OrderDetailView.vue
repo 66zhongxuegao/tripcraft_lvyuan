@@ -75,6 +75,9 @@
           <span v-if="order.dispatch.lost" class="tl-lost">{{ order.dispatch.lost_reason }}</span>
         </div>
 
+        <!-- 行中事件：十类角色并行评审的团队决策（时间线与已保存决策回填都在组件内） -->
+        <IncidentDecisionPanel :order-id="orderId" />
+
         <!-- 六阶段文档入口：阶段分区 + 当前阶段置顶 + 该阶段唯一主动作（R01） -->
         <div class="card sec" data-testid="stage-docs">
           <div class="sec-title title-rule">
@@ -239,6 +242,7 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import SIcon from '@/components/SIcon.vue'
 import Countdown from '@/components/Countdown.vue'
+import IncidentDecisionPanel from '@/components/IncidentDecisionPanel.vue'
 import client from '@/api/client'
 import { useJourney } from '@/composables/useJourney'
 import { useUserStore } from '@/stores/user'

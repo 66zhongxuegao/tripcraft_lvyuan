@@ -78,6 +78,16 @@ def _add(c, headers, order_id, *kinds):
         assert r.status_code == 200, r.text
 
 
+def _hub_inquiry(c, headers, text):
+    """在资源对接群里问一句：酒店/车队联系方式要等学员真的询过价才开放。"""
+    groups = c.get("/practice/im/sessions", headers=headers,
+                   params={"order_id": ORDER}).json()
+    hub = next(g for g in groups if g["code"] == "hub")
+    r = c.post(f"/practice/im/sessions/{hub['session_id']}/messages", headers=headers,
+               json={"sender": "我", "role": "me", "content": text})
+    assert r.status_code == 200, r.text
+
+
 def _room(c, headers, kind):
     """新模型：没有自动建的"酒店沟通群"，只有加了好友之后的单聊。"""
     groups = c.get("/practice/im/sessions", headers=headers,
@@ -91,8 +101,13 @@ def test_group_chat_becomes_evidence(auth_client):
 
     groups = c.get("/practice/im/sessions", headers=headers,
                    params={"order_id": ORDER}).json()
-    assert [g["code"] for g in groups] == ["hub"]      # 只给一个资源大群，别的群自己拉
+    codes = {g["code"] for g in groups}
+    # 新模型：需求确认后固定给「资源对接群」+「票务固定窗口」，地接由平台自动指派；
+    # 酒店/车队/司导要等学员在群里问过需求才开放，所以此时不该有这几类单聊。
+    assert {"hub", "ticket"} <= codes
+    assert not any(code.startswith(("dm-酒店", "dm-车队", "dm-客户")) for code in codes)
 
+    _hub_inquiry(c, headers, "这三天四星房和用车什么价？")
     _add(c, headers, ORDER, "地接社", "酒店")
     hotel = _room(c, headers, "酒店")
     assert hotel["name"] and hotel["kind"] == "酒店"
@@ -117,6 +132,7 @@ def test_group_step_map_covers_the_new_session_kinds(auth_client):
     """聊天的内部步骤落点要覆盖新模型的会话类型（大群 / 单聊 / 自建群）。"""
     c, headers = auth_client
     _seed_for_current_account(c, headers)
+    _hub_inquiry(c, headers, "酒店和用车什么价？")
     _add(c, headers, ORDER, "地接社", "酒店", "客户")
 
     groups = c.get("/practice/im/sessions", headers=headers,
@@ -152,6 +168,7 @@ def test_scoring_agent_receives_resource_facts():
 def test_score_order_passes_facts_into_prompt(auth_client):
     c, headers = auth_client
     _seed_for_current_account(c, headers)
+    _hub_inquiry(c, headers, "四星和用车什么价？")
     _add(c, headers, ORDER, "地接社", "酒店")
     hotel = _room(c, headers, "酒店")
     c.post(f"/practice/im/sessions/{hotel['session_id']}/messages", headers=headers,

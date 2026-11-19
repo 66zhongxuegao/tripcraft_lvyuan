@@ -14,7 +14,7 @@ from fastapi import FastAPI
 
 from tripcraft.api.context import AppContext
 from tripcraft.api.routers import register_routers
-from tripcraft.api.security import install_auth
+from tripcraft.api.security import ApiPrefixMiddleware, install_auth
 from tripcraft.services.visit_monitor import VisitMonitorMiddleware
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -39,6 +39,12 @@ def create_app() -> FastAPI:
         app.state.scenario_startup_error = f"{type(exc).__name__}: {exc}"
 
     install_auth(app, ctx)
+
+    # SERVE_WEB 单端口部署：前端 axios baseURL 固定 `/api`（frontend/src/api/client.ts），
+    # 本地开发由 vite 代理 rewrite，单端口时没有代理，必须由后端在自己这边剥前缀。
+    # 中间件**最后 add 的在最外层**，因此它先于认证中间件与路由匹配执行；
+    # 纯 ASGI 实现同时覆盖 HTTP 与 WebSocket（/api/voice/realtime 等）。
+    app.add_middleware(ApiPrefixMiddleware)
 
     # 托管前端构建（单容器部署用；本地开发仍走 vite 代理）
     dist = ROOT / "frontend" / "dist"

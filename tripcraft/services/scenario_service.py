@@ -215,6 +215,7 @@ _SUPPLIER_IM_SIG = "【这一单的客观事实（只能基于这些回答，不
 _GUARD_SIG = "你是定制游交付物的合规质检员"
 _PROFILER_SIG = "你是入境游定制师训练系统的「画像 Agent」"
 _HAT_SIG = "六帽审查"
+_TEAM_DECISION_SIG = "团队决策"
 _REQUIREMENTS_SIG = "你是需求结构化专家"
 _DISPATCH_SIG = "你是携程定制游平台的派单系统"
 _TOOLS_SUPPLIER_SIG = "【当前情景约束】"
@@ -463,6 +464,7 @@ class ScenarioLLM:
             (_GUARD_SIG, self._guard_semantic),
             (_PROFILER_SIG, self._profiler),
             (_HAT_SIG, self._hat),
+            (_TEAM_DECISION_SIG, self._team_decision),
             (_REQUIREMENTS_SIG, self._requirements),
             (_DISPATCH_SIG, self._dispatch),
             (_TOOLS_SUPPLIER_SIG, self._tools_supplier),
@@ -605,6 +607,28 @@ class ScenarioLLM:
     def _hat(self, system: str, user: str) -> str:
         return json.dumps({"verdict": "合格", "note": "标准案例资料已按红线预审，无需修改。"},
                           ensure_ascii=False)
+
+    def _team_decision(self, system: str, user: str) -> str:
+        """「团队决策」十类角色评审的确定性立场：按 system 里的角色名分派。
+
+        十类角色归并到 5 个评审口径（客户接受度/资源方可行性/司导现场执行/风控合规/
+        教练评分口径），离线 provider 只认这 5 个关键词；角色名缺失时显式报错，
+        不返回空立场（离线响应器不静默兜底）。
+        """
+        if "资源方可行性" in system:
+            data = {"stance": "有条件接受", "reason": "现场可换车，但换车费由谁承担要先写清",
+                    "condition": "换车费 400 由车队承担"}
+        elif "客户接受度" in system:
+            data = {"stance": "接受", "reason": "客户只要求行程不中断，换车即可接受"}
+        elif "司导现场执行" in system:
+            data = {"stance": "接受", "reason": "司导可现场协调换车，执行路径清晰"}
+        elif "风控合规" in system:
+            data = {"stance": "接受", "reason": "不影响安全与合规红线"}
+        elif "教练评分口径" in system:
+            data = {"stance": "接受", "reason": "处置对应行中执行与沟通技能点，口径可评"}
+        else:
+            raise ScenarioError("团队决策缺少角色名，拒绝返回空立场")
+        return json.dumps(data, ensure_ascii=False)
 
     def _requirements(self, system: str, user: str) -> str:
         doc = (self.case.get("documents") or {}).get("requirement_sheet") or {}

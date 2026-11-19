@@ -185,9 +185,16 @@ class DeliverableService:
         if not order:
             raise DeliverableError(f"未找到订单: {order_id}")
         if spec.code == "requirement_sheet":
-            from .supplier_service import SupplierService
-            if "客户" not in SupplierService(self._store, practice=self._practice).added_contacts(order_id):
-                raise DeliverableError("请先在聊天界面添加本单客户，再填写并提交需求确认单")
+            # 一键补齐模板已按本单事实生成成稿并通过预检，提交的是这份成稿；
+            # 它不属于「从聊天到交付物」的手工填写流程，因此不要求先加客户。
+            # 手工新建/填写需求确认单仍要求先把客户加进通讯录。
+            draft = self._store.deliverable_draft(order_id, spec.id) or {}
+            imported = (json.loads(draft.get("validation_json") or "{}").get("origin")
+                        == "complete-template-v2")
+            if not imported:
+                from .supplier_service import SupplierService
+                if "客户" not in SupplierService(self._store, practice=self._practice).added_contacts(order_id):
+                    raise DeliverableError("请先在聊天界面添加本单客户，再填写并提交需求确认单")
 
         if submit_once:
             lock = self._submit_locks.setdefault((order_id, spec.id), threading.Lock())

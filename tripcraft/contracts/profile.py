@@ -63,6 +63,30 @@ def overall_value(params: dict[str, float], dimensions: frozenset[Dimension] | N
 
 
 @dataclass
+class AbilityProfile:
+    """技能点级能力画像 —— 薄弱项排序的唯一口径。
+
+    params: {skill_point_id: 0-100}。只对已录入的技能点排序，不补 0。
+    """
+
+    params: dict[str, float] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        normalized: dict[str, float] = {}
+        for skill_point_id, value in self.params.items():
+            if skill_point_id not in SKILL_POINTS_BY_ID:
+                raise KeyError(f"未知技能点: {skill_point_id}")
+            normalized[skill_point_id] = max(0.0, min(100.0, float(value)))
+        self.params = normalized
+
+    def weak_top(self, n: int = 3) -> list[str]:
+        """薄弱项 top-n：value 升序、同分按 skill_point_id 字典序；不足 n 返回全部。"""
+        n = max(0, int(n))
+        ordered = sorted(self.params.items(), key=lambda kv: (kv[1], kv[0]))
+        return [skill_point_id for skill_point_id, _ in ordered[:n]]
+
+
+@dataclass
 class LearnerProfile:
     """学员画像（对应 PRD 第 5.2.1 节 learner_profile）。"""
 

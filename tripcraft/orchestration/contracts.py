@@ -87,16 +87,27 @@ class Plan:
 
 @dataclass
 class RunResult:
-    """一次 Orchestra 执行的最终结果。"""
+    """一次 Orchestra 执行的最终结果。
+
+    `batches` 记录「哪些任务在同一批并行执行」：同批内任务互不依赖，
+    批与批之间有先后。前端/日志据此区分「团队并行」与「单链顺序」。
+    """
 
     ok: bool
     outputs: dict[str, Any] = field(default_factory=dict)
     trace: list[TraceEvent] = field(default_factory=list)
     error: str = ""
     run_id: str = ""
+    batches: tuple[tuple[str, ...], ...] = ()
 
     def trace_dicts(self) -> list[dict]:
         return [event.as_dict() for event in self.trace]
+
+    def batch_dicts(self) -> list[dict]:
+        return [
+            {"index": i, "tasks": list(ids), "size": len(ids), "parallel": len(ids) > 1}
+            for i, ids in enumerate(self.batches)
+        ]
 
 
 class Blackboard:

@@ -45,8 +45,23 @@ if ($Mode -eq 'Demo') {
     $instanceLabel = '正常训练实例'
 }
 
+# Python / Node：优先项目 .venv，其次 PATH，最后才回落到原固定路径。
+# （新版曾把 Python 写死成开发机 D:\python\python.exe，换机后 旅鸢桌面版.bat 直接报“未找到项目 Python”。）
 $pythonExe = 'D:\python\python.exe'
+if (!(Test-Path -LiteralPath $pythonExe)) {
+    $venvPython = Join-Path $launchRoot '.venv\Scripts\python.exe'
+    if (Test-Path -LiteralPath $venvPython) {
+        $pythonExe = $venvPython
+    } else {
+        $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
+        if ($pythonCmd) { $pythonExe = $pythonCmd.Source }
+    }
+}
 $nodeExe = 'D:\nodejs\node.exe'
+if (!(Test-Path -LiteralPath $nodeExe)) {
+    $nodeCmd = Get-Command node -ErrorAction SilentlyContinue
+    if ($nodeCmd) { $nodeExe = $nodeCmd.Source }
+}
 $viteJs = Join-Path $frontendDir 'node_modules\vite\bin\vite.js'
 New-Item -ItemType Directory -Path $runtimeDir -Force | Out-Null
 $instanceMarker = Join-Path $runtimeDir 'instance.json'
@@ -293,7 +308,10 @@ if ($WebOnly) {
     }
     # DSH 环境可能带 ELECTRON_RUN_AS_NODE：留着会让 electron 被当纯 Node 跑，开不出窗口
     Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue
-    Start-Process -FilePath $cachedExe -ArgumentList @(('"' + $frontendDir + '"')) -WorkingDirectory $frontendDir `
+    # 自检窗口在无 GPU 的会话里 capturePage 会抛 UnknownVizError：只用自检时关掉 GPU，正常窗口不受影响。
+    $electronArgs = @(('"' + $frontendDir + '"'))
+    if ($SelfCheck) { $electronArgs += '--disable-gpu' }
+    Start-Process -FilePath $cachedExe -ArgumentList $electronArgs -WorkingDirectory $frontendDir `
         -RedirectStandardOutput (Join-Path $runtimeDir 'electron-desktop.out.log') `
         -RedirectStandardError (Join-Path $runtimeDir 'electron-desktop.err.log') | Out-Null
     Write-Output "  桌面窗口已打开（$instanceLabel）：后端 $backendPort / 前端 $frontendPort / 库 $dbPath"

@@ -19,7 +19,7 @@ DEFAULT_DB = ROOT / "tripcraft.sqlite"
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
   user_id TEXT PRIMARY KEY, username TEXT UNIQUE, display_name TEXT DEFAULT '',
-  password_hash TEXT DEFAULT '', password_salt TEXT DEFAULT '', login_password TEXT DEFAULT '', kind TEXT DEFAULT 'real',
+  password_hash TEXT DEFAULT '', password_salt TEXT DEFAULT '', kind TEXT DEFAULT 'real',
   company TEXT DEFAULT '', phone TEXT DEFAULT '', email TEXT DEFAULT '', bio TEXT DEFAULT '',
   created_at TEXT, updated_at TEXT, last_login_at TEXT);
 CREATE TABLE IF NOT EXISTS sessions (
@@ -51,6 +51,9 @@ CREATE TABLE IF NOT EXISTS thread_message (
 CREATE TABLE IF NOT EXISTS asset (
   asset_id TEXT PRIMARY KEY, user_id TEXT, thread_id TEXT, skill_point_id TEXT,
   type TEXT, title TEXT, content TEXT, evidence TEXT, created_at TEXT);
+CREATE TABLE IF NOT EXISTS asset_version (
+  asset_id TEXT, version INTEGER, content TEXT, created_at TEXT,
+  PRIMARY KEY (asset_id, version));
 CREATE TABLE IF NOT EXISTS quiz_attempt (
   attempt_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, skill_point_id TEXT, question_id TEXT,
   question TEXT, answer TEXT, correct INTEGER, score REAL, created_at TEXT);
@@ -190,7 +193,6 @@ class Store:
 
     # 轻量迁移：老库缺列时补齐（不引入迁移框架）
     _MIGRATIONS: dict[str, dict[str, str]] = {
-        "users": {"login_password": "TEXT DEFAULT ''"},
         "deliverable_draft": {"validation_json": "TEXT DEFAULT ''"},
         "ability": {
             "teach_source": "TEXT DEFAULT ''", "real_source": "TEXT DEFAULT ''",
@@ -216,6 +218,9 @@ class Store:
             for name, ddl in cols.items():
                 if name not in have:
                     self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+        # 旧库把明文口令存在 users.login_password；新口径不再落库，老库启动时清掉该列。
+        if "login_password" in {r["name"] for r in self._all("PRAGMA table_info(users)")}:
+            self._conn.execute("ALTER TABLE users DROP COLUMN login_password")
 
     def _migrate_supplier_state(self) -> None:
         """supplier_state 升级为「全局默认 + 按订单覆盖」：主键要加 order_id，只能重建表。"""
@@ -346,10 +351,6 @@ class Store:
 
     def user_by_name(self, username: str) -> dict | None:
         return self._one("SELECT * FROM users WHERE username=?", (username,))
-
-    def set_login_password(self, user_id: str, password: str) -> None:
-        """本地登录助手使用；与不可逆 password_hash 分开保存。"""
-        self._exec("UPDATE users SET login_password=? WHERE user_id=?", (password or "", user_id))
 
     def set_user_password(self, user_id: str, password_hash: str, password_salt: str) -> None:
         self._exec("UPDATE users SET password_hash=?, password_salt=?, updated_at=? WHERE user_id=?",
@@ -543,6 +544,23 @@ class Store:
     def asset(self, asset_id: str) -> dict | None:
         return self._one("SELECT * FROM asset WHERE asset_id=?", (asset_id,))
 
+    # 材料版本：同一资产每次通过发布追加一份正文快照，version 从 1 递增。
+    def add_asset_version(self, asset_id: str, content: str) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(version), 0) + 1 AS v FROM asset_version WHERE asset_id=?",
+                (asset_id,)).fetchone()
+            version = int(row["v"])
+            self._conn.execute(
+                "INSERT INTO asset_version(asset_id, version, content, created_at) VALUES(?,?,?,?)",
+                (asset_id, version, content, now()))
+            self._conn.commit()
+        return version
+
+    def asset_versions(self, asset_id: str) -> list[dict]:
+        return self._all(
+            "SELECT * FROM asset_version WHERE asset_id=? ORDER BY version", (asset_id,))
+
     # 答题
     def add_attempt(self, user_id: str, sp: str, qid: str, question: dict, answer: str, correct: bool, score: float) -> int:
         cur = self._exec("INSERT INTO quiz_attempt(user_id, skill_point_id, question_id, question, answer, correct, score, created_at) VALUES(?,?,?,?,?,?,?,?)",
@@ -570,8 +588,16 @@ class Store:
     # 订单
     def upsert_order(self, order_id: str, user_id: str, customer: str, destination: str,
                      status: str, stage_index: int, payload: dict | None = None) -> None:
+        new_payload = json.dumps(payload or {}, ensure_ascii=False)
+        old = self._one("SELECT user_id, customer, destination, payload FROM biz_order WHERE order_id=?",
+                        (order_id,))
         self._exec("INSERT OR REPLACE INTO biz_order(order_id, user_id, customer, destination, status, stage_index, payload, created_at) VALUES(?,?,?,?,?,?,?,?)",
-                   (order_id, user_id, customer, destination, status, stage_index, json.dumps(payload or {}, ensure_ascii=False), now()))
+                   (order_id, user_id, customer, destination, status, stage_index, new_payload, now()))
+        if old and (old["user_id"] != user_id or old["customer"] != customer
+                    or old["destination"] != destination or (old["payload"] or "{}") != new_payload):
+            # 订单行被整体改写（换 payload/归属）后，旧客户卡里保留下来的
+            # 人设与事实属于上一张单，必须按新行重建，否则会读到别人的客户身份。
+            self._exec("DELETE FROM order_customer WHERE order_id=?", (order_id,))
         self.ensure_customer_card(order_id, fill_hidden=bool((payload or {}).get("generated")))
 
     def orders(self, user_id: str | None = None) -> list[dict]:

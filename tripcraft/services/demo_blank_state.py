@@ -43,7 +43,6 @@ def ensure_account(ctx, *, reset: bool = True) -> dict:
         user = auth.register(USERNAME, PASSWORD, display_name=DISPLAY_NAME, kind="demo")
     else:
         store.update_user_profile(user["user_id"], {"display_name": DISPLAY_NAME})
-        store.set_login_password(user["user_id"], PASSWORD)
         store._exec("UPDATE users SET kind='demo' WHERE user_id=?", (user["user_id"],))
     if reset:
         reset_blank(ctx, user["user_id"])

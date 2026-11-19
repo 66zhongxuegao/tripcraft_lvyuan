@@ -213,21 +213,23 @@ class AuthService:
             raise AuthConflictError(f"用户名已被占用: {username}") from exc
         if not row:
             row = self.store.user_by_id(user_id) or {}
-        self.store.set_login_password(user_id, password)
         return public_user(row) or {}
 
     def login_accounts(self) -> list[dict]:
-        """登录页账户列表；只返回展示信息与本地回填密码，不返回哈希。"""
+        """登录页账户列表；只返回展示信息，不返回密码或哈希。
+
+        口令一律不落库明文（见 tests/test_auth_service.py 的「非明文/不扩表」断言），
+        所以这里 password 恒为空串，登录页只回填账户名，口令由使用者自己输入。
+        """
         rows = self.store._all(
-            "SELECT user_id, username, display_name, kind, login_password FROM users ORDER BY "
+            "SELECT user_id, username, display_name, kind FROM users ORDER BY "
             "CASE WHEN username='demo-flow' THEN 0 WHEN username='demo-blank' THEN 1 ELSE 2 END, username")
         out = []
         for row in rows:
-            password = row.get("login_password") or ""
             label = (row.get("display_name") or row.get("username") or "").strip()
             # 演示账号只展示姓名本身；普通训练账号保留账户类型提示。
             suffix = "" if row.get("kind") == "demo" else " · 训练账户"
-            out.append({"username": row.get("username") or "", "password": password,
+            out.append({"username": row.get("username") or "", "password": "",
                         "display_name": row.get("display_name") or row.get("username") or "",
                         "kind": row.get("kind") or "real", "label": f"{label}{suffix}"})
         return out

@@ -30,6 +30,47 @@ TEACHING_AGENTS: tuple[AgentSpec, ...] = (
               "白帽事实、黑帽逻辑等六顶帽子审查"),
 )
 
+# 六顶思考帽：每一顶都是独立 Agent（并行跑，蓝帽负责仲裁与最终判定）。
+REVIEW_AGENTS: tuple[AgentSpec, ...] = (
+    AgentSpec("review.white", "白帽·事实核查", "review", ("facts", "knowledge"),
+              "对照知识点基座与 Rubric 逐条核对材料事实"),
+    AgentSpec("review.black", "黑帽·逻辑审计", "review", ("logic", "risk"),
+              "反幻觉核心：找矛盾、过度承诺与无中生有"),
+    AgentSpec("review.green", "绿帽·创意转化", "review", ("clarity", "example"),
+              "判断是否讲得通俗、有例子，而不是照抄资料"),
+    AgentSpec("review.yellow", "黄帽·激励引导", "review", ("motivation",),
+              "判断是否正面鼓励、给可执行下一步"),
+    AgentSpec("review.red", "红帽·个性适配", "review", ("persona", "difficulty"),
+              "判断难度与语气是否贴合该学员掌握度"),
+    AgentSpec("review.blue", "蓝帽·质量总控", "review", ("arbitrate", "verdict"),
+              "汇总五顶帽子结论，给出最终合格/需修改判定"),
+)
+
+# 实训团队决策：行中事件处置时十类角色同批并行评估，再按写死规则仲裁。
+# id 与 services/team_decision.py 的 TEAM_ROLES 一一对应；缺一个 decide() 就会少一票。
+PRACTICE_TEAM_AGENTS: tuple[AgentSpec, ...] = (
+    AgentSpec("practice.team.customer", "客户接受度", "practice", ("acceptance", "customer"),
+              "从该单客户人设出发判断处置方案能否被接受"),
+    AgentSpec("practice.team.planner", "资源方可行性", "practice", ("feasibility", "cost"),
+              "定制师视角判断资源能否协调、是否加价或换资源"),
+    AgentSpec("practice.team.dmo", "地接可行性", "practice", ("feasibility", "dmo"),
+              "地接社能否在目的地落地执行，库存与档期是否支持"),
+    AgentSpec("practice.team.fleet", "车队可行性", "practice", ("feasibility", "fleet"),
+              "车队/车辆能否调度，车型与营运资质是否满足"),
+    AgentSpec("practice.team.guide", "司导现场执行", "practice", ("execution", "scene"),
+              "判断司导现场是否可执行、需要什么支援"),
+    AgentSpec("practice.team.driver", "司机现场执行", "practice", ("execution", "drive"),
+              "司机视角判断实际驾驶与时间安排是否可行"),
+    AgentSpec("practice.team.hotel", "酒店可行性", "practice", ("feasibility", "hotel"),
+              "酒店房态与入住安排能否配合处置"),
+    AgentSpec("practice.team.platform", "平台合规", "practice", ("compliance", "platform"),
+              "平台规则、票据与派单口径是否允许该处置"),
+    AgentSpec("practice.team.risk", "风控合规", "practice", ("risk", "compliance"),
+              "安全/合规红线一票否决（无证、超时、违背客人明确约定）"),
+    AgentSpec("practice.team.director", "总控评分口径", "practice", ("score", "rubric"),
+              "从评分口径说明该处置对应哪些技能点与动作"),
+)
+
 PRACTICE_AGENTS: tuple[AgentSpec, ...] = (
     AgentSpec("practice.hub", "资源大群调度", "practice", ("hub", "route"),
               "资源大群按订单与发言对象定位资源方"),
@@ -44,7 +85,7 @@ PRACTICE_AGENTS: tuple[AgentSpec, ...] = (
 )
 
 AGENT_SPECS: dict[str, AgentSpec] = {
-    spec.id: spec for spec in (TEACHING_AGENTS + PRACTICE_AGENTS)
+    spec.id: spec for spec in (TEACHING_AGENTS + REVIEW_AGENTS + PRACTICE_AGENTS + PRACTICE_TEAM_AGENTS)
 }
 
 

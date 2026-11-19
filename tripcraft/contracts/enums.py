@@ -2,7 +2,7 @@
 
 口径来源：PRD 第 3 章（状态机）、第 5.3 节（关键枚举）、
 第 17 章（8 维 61 技能点）、第 18 章（Rubric / 掌握度 M1-M5）、
-第 7 章（难度 L1-L4）、第 19 章（A/B 考点）。
+第 7 章（难度 L1-L5）、第 19 章（A/B 考点）。
 
 约定：所有跨模块共享的取值都定义在本文件，禁止在别处重复定义（单一数据源）。
 """
@@ -170,12 +170,13 @@ def mastery_of(value: float) -> MasteryLevel:
 
 
 class DifficultyLevel(StrEnum):
-    """难度四级（PRD 第 7.2 / 18.5 节）。"""
+    """难度五级（PRD 第 7.2 / 18.5 节；L5 为 PPT 五层难度扩档）。"""
 
     L1 = "L1"  # 入门
     L2 = "L2"  # 进阶
     L3 = "L3"  # 熟练
     L4 = "L4"  # 高压
+    L5 = "L5"  # 极限
 
 
 DIFFICULTY_NAMES: dict[DifficultyLevel, str] = {
@@ -183,6 +184,7 @@ DIFFICULTY_NAMES: dict[DifficultyLevel, str] = {
     DifficultyLevel.L2: "进阶",
     DifficultyLevel.L3: "熟练",
     DifficultyLevel.L4: "高压",
+    DifficultyLevel.L5: "极限",
 }
 
 

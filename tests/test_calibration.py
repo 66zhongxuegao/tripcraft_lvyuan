@@ -1,6 +1,10 @@
 """人工校准集测试（指标与阈值标定，离线）。"""
 
+import pytest
+
 from tripcraft.calibration import MIN_PER_SKILL_POINT, audit_dataset, load_samples, normalize_text
+from tripcraft.services.calibration import (agreement as p11_agreement, evaluate as p11_evaluate,
+                                            load_calibration as p11_load_calibration)
 from tripcraft.calibration.metrics import (MIN_KEPT_RATIO, TARGET_AGREEMENT, evaluate,
                                            sweep_thresholds)
 from tripcraft.contracts.rubric import RUBRICS
@@ -117,3 +121,57 @@ def test_sweep_reports_failure_when_target_unreachable():
 def test_sweep_without_predictions_returns_defaults():
     out = sweep_thresholds([], target=TARGET_AGREEMENT)
     assert out["passed"] is False and out["confidence"] > 0
+
+
+# ---------------- P11 双评一致性（tripcraft/services/calibration.py） ----------------
+
+def test_p11_perfect_agreement_kappa_is_one():
+    out = p11_agreement([10.0, 50.0, 90.0], [10.0, 50.0, 90.0])
+    assert out["n"] == 3
+    assert out["exact"] == 1.0 and out["within_5"] == 1.0
+    assert out["cohen_kappa"] == 1.0
+
+
+def test_p11_full_disagreement_kappa_negative():
+    out = p11_agreement([10.0, 10.0, 90.0, 90.0], [90.0, 90.0, 10.0, 10.0])
+    assert out["exact"] == 0.0
+    assert out["cohen_kappa"] < 0
+
+
+def test_p11_length_mismatch_raises():
+    with pytest.raises(ValueError):
+        p11_agreement([1.0, 2.0], [1.0])
+
+
+def test_p11_within_5_boundary():
+    out = p11_agreement([50.0, 50.0], [55.0, 55.1])
+    assert out["within_5"] == 0.5
+    assert out["exact"] == 0.0
+
+
+def test_p11_builtin_samples_evaluate_runs(monkeypatch):
+    import tripcraft.calibration.dataset as ds
+
+    monkeypatch.setattr(ds, "load_samples", lambda: [])
+    rows = p11_load_calibration()
+    assert len(rows) == 3
+    assert all({"a", "b"} <= set(r) for r in rows)
+    out = p11_evaluate(rows)
+    assert out["n"] == 3 and isinstance(out["ok"], bool)
+
+
+def test_p11_load_calibration_prefers_dual_rated_samples(monkeypatch):
+    import tripcraft.calibration.dataset as ds
+
+    monkeypatch.setattr(ds, "load_samples", lambda: [
+        {"a": 90.0, "b": 90.0}, {"a": 70.0, "b": 65.0},
+    ])
+    assert p11_load_calibration() == [{"a": 90.0, "b": 90.0}, {"a": 70.0, "b": 65.0}]
+
+
+def test_p11_ok_threshold_on_kappa():
+    good = p11_evaluate([{"a": 10.0, "b": 10.0}, {"a": 90.0, "b": 90.0}])
+    assert good["cohen_kappa"] == 1.0 and good["ok"] is True
+    poor = p11_evaluate([{"a": 92.0, "b": 90.0}, {"a": 78.0, "b": 74.0},
+                         {"a": 65.0, "b": 58.0}])
+    assert poor["cohen_kappa"] < 0.6 and poor["ok"] is False

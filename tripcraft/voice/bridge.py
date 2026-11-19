@@ -254,6 +254,10 @@ class VoiceBridge:
     async def _pump(self, queue: asyncio.Queue) -> None:
         from ..services.customer_card import check_reply
         from ..services.customer_context import build_customer_system, fallback_reply
+        # store 只在 __init__ 里从 call_svc/practice._store 派生，可能为空（真实链路里
+        # 上游没带存储句柄，或单测用 object.__new__ 建桥）。没有存储时只回放转写，
+        # 不做事实卡校验/冲突记录，避免整轮语音被打断。
+        store = getattr(self, "store", None)
         frames, transcript, deltas, byte_count, retry = [], "", "", 0, 0
         try:
             while True:
@@ -282,18 +286,18 @@ class VoiceBridge:
                     continue
                 if event_type == "response.done":
                     transcript = (transcript or deltas).strip()
-                    card = self.store.ensure_customer_card(self.order["order_id"])
+                    card = store.ensure_customer_card(self.order["order_id"]) if store is not None else None
                     question = getattr(self, "_last_student_question", "")
-                    issues = check_reply(transcript, card, question=question)
-                    if not transcript or byte_count > 16 * 1024 * 1024:
+                    issues = check_reply(transcript, card, question=question) if card is not None else []
+                    if card is not None and (not transcript or byte_count > 16 * 1024 * 1024):
                         issues.append({"key": "voice", "reason": "unverifiable_audio"})
-                    if issues:
+                    if issues and store is not None:
                         for issue in issues:
-                            self.store.record_customer_conflict(self.order["order_id"], issue, "voice",
-                                                               f"{self.session_id}:{len(self.lines)}:{retry}")
+                            store.record_customer_conflict(self.order["order_id"], issue, "voice",
+                                                           f"{self.session_id}:{len(self.lines)}:{retry}")
                         if retry == 0 and self.client is not None:
                             retry = 1
-                            correction = build_customer_system(self.order["order_id"], "voice", store=self.store)
+                            correction = build_customer_system(self.order["order_id"], "voice", store=store)
                             correction += "\n上一条回复已被拦截，未播放。请保持出游客户身份，按事实卡重新回答原问题；表达自己的需求或请定制师给建议，不采集定制师的旅行需求，不替对方提供服务。纠正：" + json.dumps(issues, ensure_ascii=False)
                             self.client.update_instructions(correction)
                             self.client.ask_text("请重新回答定制师的原话：" + question)
@@ -314,9 +318,9 @@ class VoiceBridge:
                         await self._send({"type": "state", "value": "idle", "message": "本轮已切换为文字回复"})
                     await self._send({"type": "state", "value": "listening"})
                     if self.client is not None:
+                        history = store.conversation_turns(self.order["order_id"], 10) if store is not None else []
                         self.client.update_instructions(build_customer_system(
-                            self.order["order_id"], "voice", store=self.store,
-                            history=self.store.conversation_turns(self.order["order_id"], 10)))
+                            self.order["order_id"], "voice", store=store, history=history))
                     frames, transcript, deltas, byte_count = [], "", "", 0
                     continue
                 line = transcript_line(ev)
@@ -389,9 +393,13 @@ class VoiceBridge:
                 self.call_svc.record_line(sess, "student", text)
 
     def _agent(self, text: str) -> None:
-        from ..services.customer_context import observe_reply
-        observe_reply(self.store, self.order["order_id"], text, "voice",
-                      f"{self.session_id}:voice:{len(self.lines)}", getattr(self, "_last_student_question", ""))
+        # store 只在 __init__ 里从 call_svc/practice._store 派生；没有 store（或单测用
+        # object.__new__ 建桥）时跳过事实观测，仍照常记内存行，避免整轮转写被 AttributeError 打断。
+        store = getattr(self, "store", None)
+        if store is not None:
+            from ..services.customer_context import observe_reply
+            observe_reply(store, self.order["order_id"], text, "voice",
+                          f"{self.session_id}:voice:{len(self.lines)}", getattr(self, "_last_student_question", ""))
         if self.lines and self.lines[-1]["who"] == "agent" and self.lines[-1]["text"] == text:
             return
         self.lines.append({"who": "agent", "text": text})

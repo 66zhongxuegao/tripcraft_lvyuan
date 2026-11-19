@@ -5,7 +5,7 @@
 - 单例属性：runs / profiles / s2_sessions / store / practice / tools / guard / director /
   call_svc / supplier_svc / finance_svc / deliverable_svc / plan_svc
 - 惰性 getter：get_llm / get_threads / get_deliverables / get_plans / get_tools / get_guard /
-  get_director / get_call / get_finance / get_supplier / get_auth
+  get_director / get_call / get_finance / get_supplier / get_team_decision / get_auth
 - 路由模块不得自行 new 服务，避免同一 app 内出现两套状态（尤其是 director 与 practice 的绑定）。
 
 变更此契约必须升版并通知全部 owner。
@@ -28,6 +28,7 @@ from tripcraft.services.plan_service import PlanService
 from tripcraft.services.practice_service import PracticeService
 from tripcraft.services.s2_session import S2Session
 from tripcraft.services.supplier_service import SupplierService
+from tripcraft.services.team_decision import TeamDecisionService
 from tripcraft.services.thread_service import ThreadService
 from tripcraft.services.tools_service import ToolsService
 from tripcraft.storage import Store
@@ -69,6 +70,8 @@ class AppContext:
 
         # 认证服务由 identity 模块提供；延迟导入，拆分期间不阻塞其它域。
         self._auth = None
+        # 团队决策服务：第一次请求时装配（llm 取当时的 get_llm()，兼容离线 provider 注入）。
+        self._team_decision: TeamDecisionService | None = None
 
     # ---------------- LLM 与惰性服务 ----------------
 
@@ -145,6 +148,17 @@ class AppContext:
             except LLMError:
                 pass
         return self.supplier_svc
+
+    def get_team_decision(self) -> TeamDecisionService:
+        """实训团队决策服务（带缓存）：未配置模型时服务内部走确定性规则。"""
+        if self._team_decision is None:
+            try:
+                llm = self.get_llm()
+            except LLMError:
+                llm = None
+            self._team_decision = TeamDecisionService(
+                self.store, practice=self.practice, llm=llm, conductor=self.conductor)
+        return self._team_decision
 
     # ---------------- 认证（owner: identity） ----------------
 

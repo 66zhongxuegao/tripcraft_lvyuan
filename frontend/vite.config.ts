@@ -33,6 +33,19 @@ export default defineConfig(({ mode }) => {
     resolve: {
       alias: { '@': resolve(__dirname, 'src') },
     },
+    // Vite 5 默认调 sass 的 legacy JS API，sass-embedded 1.105 每次构建刷 28 条弃用警告；
+    // 显式切 modern-compiler 后告警消失，产物不变。
+    css: {
+      preprocessorOptions: {
+        scss: { api: 'modern-compiler' as const },
+        sass: { api: 'modern-compiler' as const },
+      },
+    },
+    build: {
+      // 阈值与产物实际体量对齐（入口 ~1.15 MB / gzip ~383 kB，各路由已懒加载）；
+      // 低于此值不再刷 chunk 体积警告，同时不引入 vendor 分包（分包会让同模块重复进多个 chunk）。
+      chunkSizeWarningLimit: 1200,
+    },
     server: {
       port: devPort,
       strictPort: true,
